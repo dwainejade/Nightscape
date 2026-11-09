@@ -10,7 +10,7 @@ import {
 } from '../shaders/legacy'
 import { buildNoise } from './noise'
 import { useSettings, hexToLinear, type Clouds, type Place } from '../store/settings'
-import { loadElevationWindow, WINDOW_PX } from '../geo/elevation'
+import { makeGeoRef, loadTerrainWindow, WIN, REAL_TILE, UNITS_PER_PX, type GeoRef, type TerrainWindow } from '../geo/terrainWindow'
 
 const cloudCfg = (c: Clouds) => {
   const a = (c.windDir * Math.PI) / 180
@@ -106,7 +106,21 @@ export class Engine {
   private terJobs: any[] = []
   private terJob = 0
   private terrainActive = false      // re-baking the terrain after a place change
-  private realTex: THREE.DataTexture | null = null
+  // terrain inputs shared by the terrain bakes and the ground pass
+  private terU = {
+    uTT: { value: 320 },                 // world size of the terrain tile: 320 invented, 640 real
+    uUseReal: { value: 0 },
+    uOrigin: { value: new THREE.Vector2() }, // the real window's centre, in tile coordinates
+    uReal: { value: new THREE.DataTexture(new Uint16Array(1), 1, 1, THREE.RedFormat, THREE.HalfFloatType) as THREE.Texture },
+    uImg: { value: new THREE.DataTexture(new Uint8Array(4), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType) as THREE.Texture },
+  }
+  private terTile = 320
+  private geoRef: GeoRef | null = null
+  private winOrigin = new THREE.Vector2()   // world position of the loaded real window's centre
+  private winBusy = false
+  private winRetryAt = 0
+  private pendingWin: { win: TerrainWindow; token: number } | null = null
+  private terrainRolling = false            // a re-centring bake while flying (no fade)
   private lastPlace: Place | null = null
   private placeToken = 0
   private placeAbort: AbortController | null = null
@@ -129,6 +143,9 @@ export class Engine {
     this.canFloat = ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')
     this.RT_TYPE = this.canFloat ? THREE.HalfFloatType : THREE.UnsignedByteType
     this.USE_TAA = ext.has('EXT_color_buffer_float')
+    this.terU.uReal.value.unpackAlignment = 2
+    this.terU.uReal.value.needsUpdate = true
+    this.terU.uImg.value.needsUpdate = true
     const tn = performance.now()
     const noiseTex = buildNoise(64)
     this.timings.noiseBuildMs = Math.round(performance.now() - tn)
@@ -191,7 +208,7 @@ export class Engine {
       uTerC: { value: this.terC.texture }, uTerL: { value: this.terL.texture }, uLamps: { value: 1 },
       uMast: { value: [0, 1, 2, 3].map(() => new THREE.Vector4()) }, uMastN: { value: 0 },
       uTerTop: { value: -50 }, uPixAngC: { value: 0.001 }, uNoClouds: { value: NOCLOUDS },
-    }, camU, this.lightU, cfgLive, this.morphU))
+    }, camU, this.lightU, cfgLive, this.morphU, this.terU))
     this.taaPass = makePass(TAA_FRAG, {
       tCur: { value: null }, tHist: { value: null }, uSize: { value: new THREE.Vector2() },
       uCamPos: camU.uCamPos, uCamR: camU.uCamR, uCamU: camU.uCamU, uCamF: camU.uCamF,
@@ -233,9 +250,9 @@ export class Engine {
     this.shapePass = makePass(BAKE_SHAPE_FRAG, Object.assign({ uNoise: { value: noiseTex }, uLayer: { value: 0 } }, this.cfgBake))
     this.lightPass = makePass(BAKE_LIGHT_FRAG, Object.assign({ uNoise: { value: noiseTex }, uMoonDir: { value: MOON_DIR }, uLayer: { value: 0 } }, this.cfgBake))
     this.bakeStarted = performance.now()
-    this.terHPass = makePass(TER_H_FRAG, Object.assign({ uNoise: { value: noiseTex }, uReal: { value: new THREE.DataTexture(new Uint16Array(1), 1, 1, THREE.RedFormat, THREE.HalfFloatType) }, uUseReal: { value: 0 } }, cfgLive))
-    this.terTPass = makePass(TER_T_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uZ: { value: 0 } }, cfgLive))
-    this.terLPass = makePass(TER_L_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uMoonDir: { value: MOON_DIR }, uMode: { value: 0 } }, cfgLive))
+    this.terHPass = makePass(TER_H_FRAG, Object.assign({ uNoise: { value: noiseTex } }, this.terU, cfgLive))
+    this.terTPass = makePass(TER_T_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uZ: { value: 0 } }, this.terU, cfgLive))
+    this.terLPass = makePass(TER_L_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uMoonDir: { value: MOON_DIR }, uMode: { value: 0 } }, this.terU, cfgLive))
     const J = this.terJobs
     for (let s = 0; s < 4; s++) J.push({ rt: this.terH, pass: this.terHPass, s, n: 4, label: 'H' })
     for (let s = 0; s < 8; s++) J.push({ rt: this.terA, pass: this.terLPass, mode: 0, s, n: 8, label: 'A' })
@@ -284,10 +301,36 @@ export class Engine {
     }, 350)
   }
 
+  /** Upload a real window and start baking the terrain from it. */
+  private applyWindow(win: TerrainWindow, rolling: boolean) {
+    const ref = this.geoRef!
+    const mk = (data: any, fmt: number, type: number, align: number) => {
+      const t = new THREE.DataTexture(data, WIN, WIN, fmt, type)
+      t.minFilter = t.magFilter = THREE.LinearFilter
+      t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping
+      t.unpackAlignment = align
+      t.needsUpdate = true
+      return t
+    }
+    this.terU.uReal.value.dispose(); this.terU.uImg.value.dispose()
+    this.terU.uReal.value = mk(win.half, THREE.RedFormat, THREE.HalfFloatType, 2)
+    this.terU.uImg.value = mk(win.rgba, THREE.RGBAFormat, THREE.UnsignedByteType, 1)
+    // where the window's centre sits in the world (and so in the repeating terrain tile)
+    this.winOrigin.set((win.cx - ref.gx0) * UNITS_PER_PX, (win.cy - ref.gy0) * UNITS_PER_PX)
+    this.terU.uOrigin.value.set(this.winOrigin.x / REAL_TILE, this.winOrigin.y / REAL_TILE)
+    this.terU.uUseReal.value = 1
+    this.terU.uTT.value = this.terTile = REAL_TILE
+    this.terJob = 0
+    this.terrainActive = true
+    this.terrainRolling = rolling
+    if (rolling) this.timings.windowSwaps = (this.timings.windowSwaps ?? 0) + 1
+  }
+
   /** Load a real place (or go back to the invented mountains) and re-bake the terrain under a fade to black. */
   private async loadPlace(p: Place | null) {
     const token = ++this.placeToken
     this.placeAbort?.abort()
+    this.pendingWin = null; this.winBusy = false
     const S = useSettings
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
     if (!this.baked) return // the saved place is started once the first bake is done
@@ -297,35 +340,57 @@ export class Engine {
       if (!p) {
         await sleep(450)
         if (token !== this.placeToken) return
-        this.terHPass.u.uUseReal.value = 0
+        this.geoRef = null
+        this.terU.uUseReal.value = 0
+        this.terU.uTT.value = this.terTile = 320
+        this.terJob = 0
+        this.terrainActive = true; this.terrainRolling = false
       } else {
         this.placeAbort = new AbortController()
-        const d = await loadElevationWindow(p.lat, p.lon, 70, this.placeAbort.signal)
+        const ref = makeGeoRef(p.lat, p.lon)
+        const win = await loadTerrainWindow(ref, Math.round(ref.gx0), Math.round(ref.gy0), this.placeAbort.signal)
         if (token !== this.placeToken) return
         await sleep(Math.max(0, 450 - (performance.now() - t0))) // let the fade finish
         if (token !== this.placeToken) return
-        this.realTex?.dispose()
-        const tex = new THREE.DataTexture(d.half, WINDOW_PX, WINDOW_PX, THREE.RedFormat, THREE.HalfFloatType)
-        tex.minFilter = tex.magFilter = THREE.LinearFilter
-        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
-        tex.unpackAlignment = 2
-        tex.needsUpdate = true
-        this.realTex = tex
-        this.terHPass.u.uReal.value = tex
-        this.terHPass.u.uUseReal.value = 1
-        const lo = Math.round(d.minElev), hi = Math.round(d.maxElev)
-        S.setState({ placeInfo: `${Math.round(d.windowKm)} km across, ${lo} to ${hi} m, relief drawn ${d.exaggeration.toFixed(1)}x taller than true` })
+        this.geoRef = ref
+        this.applyWindow(win, false)
+        const lo = Math.round(win.minElev), hi = Math.round(win.maxElev)
+        S.setState({ placeInfo: `${Math.round(ref.windowKm)} km wide view, ${lo} to ${hi} m, relief drawn ${ref.exaggeration.toFixed(1)}x taller than true` })
       }
-      this.simT = 0                       // start the flight over the middle of the place
-      this.terJob = 0
-      this.terrainActive = true
+      this.simT = 0 // start the flight over the middle of the place
     } catch (e: any) {
       if (token !== this.placeToken || e?.name === 'AbortError') return
       S.setState({ placeStatus: 'error', placeInfo: String(e?.message ?? e), fade: 0 })
     }
   }
 
+  /**
+   * While flying over a real place, fetch a fresh window around the camera once it has moved a good
+   * way from the centre of the loaded one, and bake it in quietly. The world-to-map mapping is the
+   * same, so the terrain already on screen does not change and the land just keeps going.
+   */
+  private updateRolling() {
+    const ref = this.geoRef
+    if (!ref || this.terrainActive) return
+    if (this.pendingWin) {
+      const w = this.pendingWin
+      this.pendingWin = null; this.winBusy = false
+      if (w.token === this.placeToken) this.applyWindow(w.win, true)
+      return
+    }
+    if (this.winBusy || performance.now() < this.winRetryAt) return
+    const c = this.camU.uCamPos.value
+    if (Math.max(Math.abs(c.x - this.winOrigin.x), Math.abs(c.z - this.winOrigin.y)) < 120) return
+    this.winBusy = true
+    const token = this.placeToken
+    const cx = Math.round(ref.gx0 + c.x / UNITS_PER_PX), cy = Math.round(ref.gy0 + c.z / UNITS_PER_PX)
+    loadTerrainWindow(ref, cx, cy, this.placeAbort?.signal)
+      .then((win) => { if (token === this.placeToken) this.pendingWin = { win, token }; else this.winBusy = false })
+      .catch(() => { this.winBusy = false; this.winRetryAt = performance.now() + 5000 })
+  }
+
   private onTerrainDone() {
+    if (this.terrainRolling) { this.terrainRolling = false; return } // a quiet re-centring: nothing to show
     this.taaPass.u.uReset.value = 1 // the view jumped: do not blend with the old place
     useSettings.setState((s) => ({ fade: 0, placeStatus: s.place ? 'ready' : 'idle' }))
   }
@@ -513,8 +578,9 @@ export class Engine {
       if (top) peaks.push({ i: bi[bj * NB + bx], y })
     }
     peaks.sort((a, b) => b.y - a.y)
-    const f = TILE / TER_N, picked: { x: number; z: number; y: number }[] = []
-    const wrap = (d: number) => ((((d + TILE / 2) % TILE) + TILE) % TILE) - TILE / 2
+    const f = this.terTile / TER_N, picked: { x: number; z: number; y: number }[] = []
+    const TT = this.terTile
+    const wrap = (d: number) => ((((d + TT / 2) % TT) + TT) % TT) - TT / 2
     for (const p of peaks) {
       if (picked.length >= 2) break
       const x = ((p.i % TER_N) + 0.5) * f, z = (((p.i / TER_N) | 0) + 0.5) * f
@@ -529,7 +595,7 @@ export class Engine {
   surfaceY(x: number, z: number) {
     const H = this.terHeights
     if (!H) return WATER_Y
-    const f = TER_N / TILE
+    const f = TER_N / this.terTile
     const u = ((((x * f - 0.5) % TER_N) + TER_N) % TER_N), v = ((((z * f - 0.5) % TER_N) + TER_N) % TER_N)
     const i0 = Math.floor(u), j0 = Math.floor(v), fu = u - i0, fv = v - j0
     const i1 = (i0 + 1) % TER_N, j1 = (j0 + 1) % TER_N
@@ -587,9 +653,10 @@ export class Engine {
       if (this.todSync > 0.25) { this.todSync = 0; useSettings.setState({ tod: this.tod }) }
     }
     // after a place change, re-bake the terrain a few jobs per frame (the scene is faded out meanwhile)
-    for (let i = 0; i < 8 && this.terrainActive; i++) {
+    for (let i = 0, per = this.terrainRolling ? 2 : 8; i < per && this.terrainActive; i++) {
       if (this.terrainStep()) { this.terrainActive = false; this.onTerrainDone() }
     }
+    this.updateRolling()
     this.updateMorph(dt)
     this.render()
     if (this.bakeActive) this.bakeStep() // background re-bake after a cloud-shape change

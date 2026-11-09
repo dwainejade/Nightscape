@@ -322,7 +322,17 @@ void main(){
 export const TER_N = 1024;
 export const TERRAIN_COMMON = `
 const float TER_LO = -100.0, TER_RANGE = 52.0;   // heights stored as (y - TER_LO) / TER_RANGE
-const float TER_TEXEL = ${320 / TER_N};
+uniform float uTT;                          // world size of the terrain tile: 320 (invented mountains) or 640 (real places)
+#define TER_TEXEL (uTT / ${TER_N}.0)
+// Satellite colour (sRGB, 0..1) -> open water / tree cover. Rough, but it follows real lakes, rivers and forests.
+float imgWater(vec3 c){
+  float lum = dot(c, vec3(0.30, 0.59, 0.11));
+  return smoothstep(0.0, 0.05, c.b - c.r - 0.01) * smoothstep(0.0, 0.03, c.b - 0.8 * c.g) * smoothstep(0.42, 0.28, lum);
+}
+float imgForest(vec3 c){
+  float lum = dot(c, vec3(0.30, 0.59, 0.11));
+  return smoothstep(0.0, 0.04, c.g - c.r) * smoothstep(0.34, 0.20, lum);
+}
 const float WATER_Y = -85.0;
 `;
 export const TERRAIN_GEN = `
@@ -379,38 +389,47 @@ precision highp float;
 precision highp sampler3D;
 uniform sampler3D uNoise;   // (the shared world code refers to it)
 uniform sampler2D uReal;    // real elevation for one place, already converted to the stored height scale
-uniform float uUseReal;     // 1: use uReal, 0: the invented mountains
+uniform sampler2D uImg;     // satellite colour for the same window
+uniform float uUseReal;     // 1: use uReal and uImg, 0: the invented mountains
+uniform vec2 uOrigin;       // where the window's centre sits, in terrain-tile coordinates
 varying vec2 vUv;
 ${COMMON}
 ${WORLD}
 ${TERRAIN_COMMON}
 ${TERRAIN_GEN}
-// Real terrain. The world tile repeats, so the real window is mirrored to make it seamless:
-// the window is centred on the start of the flight (tile coordinate 0) and folds back at its
-// edges, 80 world units out. A little invented detail is added on top, because the elevation
-// data is far coarser than the cloud-top view needs.
+// Real terrain: the elevation and satellite window sits in the tile with its centre at uOrigin
+// (the engine re-centres it as the flight goes on). A little invented detail goes on top,
+// because the elevation data is far coarser than the cloud-top view needs, and lakes and
+// rivers found in the satellite colour are sunk below the water level.
+vec2 winUV(vec2 p){ return fract(p - uOrigin + 0.5); }
 float realY(vec2 p){
-  vec2 w = 1.0 - abs(2.0 * fract(p + 0.25) - 1.0);
+  float K = uTT / 320.0;
+  vec2 w = winUV(p);
   float y = TER_LO + textureLod(uReal, w, 0.0).r * TER_RANGE;
-  float fine = 0.5 * pnoise(p, 60.0) + 0.25 * pnoise(p + 0.3, 130.0);
-  y += fine * 1.4 * smoothstep(0.3, 3.0, y - WATER_Y);
+  float wat = imgWater(textureLod(uImg, w, 0.0).rgb);
+  float fine = 0.5 * pnoise(p, 60.0 * K) + 0.25 * pnoise(p + 0.3, 130.0 * K);
+  y += fine * 1.4 * smoothstep(0.3, 3.0, y - WATER_Y) * (1.0 - wat);
+  y = mix(y, min(y, WATER_Y - 0.5), wat);
   return clamp(y, TER_LO + 0.5, TER_LO + TER_RANGE - 1.0);
 }
 float gY(vec2 p){ return uUseReal > 0.5 ? realY(p) : groundY(p); }
 void main(){
   vec2 p = gl_FragCoord.xy / ${TER_N}.0;
   float e = 1.0 / ${TER_N}.0;
+  float K = uTT / 320.0;          // the noise below is per tile, so a larger tile needs more of it
   float h0 = gY(p);
   float slope = length(vec2(gY(p + vec2(e, 0.0)) - h0, gY(p + vec2(0.0, e)) - h0)) / TER_TEXEL;
   float hw = h0 - WATER_Y;
-  // Forest: off the cliffs, above the shore, below a ragged tree line, in patches.
-  float patchN = pfbm(p + 0.29, 22.0);
+  // Forest: off the cliffs, above the shore, below a ragged tree line, in patches (or, for a real
+  // place, wherever the satellite colour is dark green).
+  float patchN = pfbm(p + 0.29, 22.0 * K);
   float forest = smoothstep(1.2, 0.65, slope) * smoothstep(0.1, 0.7, hw)
                * smoothstep(15.0, 10.0, hw + patchN * 8.0) * smoothstep(-0.28, -0.02, patchN);
+  if (uUseReal > 0.5) forest = imgForest(textureLod(uImg, winUV(p), 0.0).rgb) * smoothstep(1.2, 0.65, slope) * smoothstep(0.1, 0.7, hw);
   // Tree crowns grouped in clumps about a unit and a half across, up to ~0.35 high.
-  float cl = 0.5 + 0.35 * pnoise(p, 210.0) + 0.25 * pnoise(p + 0.5, 430.0);
+  float cl = 0.5 + 0.35 * pnoise(p, 210.0 * K) + 0.25 * pnoise(p + 0.5, 430.0 * K);
   float canopy = forest * (0.1 + 0.25 * clamp(cl, 0.0, 1.0));
-  float grain = 0.5 + 0.5 * pnoise(p + 0.61, 70.0) * 0.7 + 0.3 * pnoise(p, 260.0);
+  float grain = 0.5 + 0.5 * pnoise(p + 0.61, 70.0 * K) * 0.7 + 0.3 * pnoise(p, 260.0 * K);
   gl_FragColor = vec4((h0 + canopy - TER_LO) / TER_RANGE, forest, (h0 - TER_LO) / TER_RANGE, clamp(grain, 0.0, 1.0));
 }
 `;
@@ -421,11 +440,15 @@ uniform sampler3D uNoise;
 uniform sampler2D uTerH;
 uniform vec3 uMoonDir;
 uniform float uMode;
+uniform sampler2D uImg;
+uniform float uUseReal;
+uniform vec2 uOrigin;
+vec2 winUV(vec2 p){ return fract(p - uOrigin + 0.5); }
 varying vec2 vUv;
 ${COMMON}
 ${WORLD}
 ${TERRAIN_COMMON}
-float tH(vec2 xz){ return textureLod(uTerH, xz / TILE, 0.0).r * TER_RANGE + TER_LO; }
+float tH(vec2 xz){ return textureLod(uTerH, xz / uTT, 0.0).r * TER_RANGE + TER_LO; }
 // highest horizon (as the tangent of its angle) from height y0 looking along dir
 float horizonTan(vec2 xz, float y0, vec2 dir){
   float m = 0.0, s = 0.35;
@@ -436,7 +459,7 @@ float horizonTan(vec2 xz, float y0, vec2 dir){
   return m;
 }
 void main(){
-  vec2 xz = gl_FragCoord.xy / ${TER_N}.0 * TILE;
+  vec2 xz = gl_FragCoord.xy / ${TER_N}.0 * uTT;
   vec4 H = textureLod(uTerH, gl_FragCoord.xy / ${TER_N}.0, 0.0);
   float hs = H.r * TER_RANGE + TER_LO, hg = H.b * TER_RANGE + TER_LO;
   bool water = hg < WATER_Y;
@@ -476,6 +499,7 @@ void main(){
     vec3 trees = mix(vec3(0.020, 0.032, 0.020), vec3(0.040, 0.058, 0.034), crown);
     alb = mix(alb, trees, H.g);
     alb = mix(alb, vec3(0.060, 0.056, 0.050), smoothstep(0.7, 0.05, hw) * (1.0 - H.g));   // wet shore
+    if (uUseReal > 0.5) alb = pow(textureLod(uImg, winUV(xz / uTT), 0.0).rgb, vec3(2.2)) * (0.75 + 0.5 * H.a);   // the real colour of the land
     if (water) alb = mix(vec3(0.07, 0.065, 0.055), alb, 0.4);                                // lake bed
     gl_FragColor = vec4(sqrt(alb), 1.0);
   } else {
@@ -504,19 +528,20 @@ varying vec2 vUv;
 ${COMMON}
 ${WORLD}
 ${TERRAIN_COMMON}
-const float TOWN_N = 7.0, LAMP_N = 580.0;
-const float LC = TILE / LAMP_N;
-vec2 wrapd(vec2 v){ return mod(v + 0.5 * TILE, TILE) - 0.5 * TILE; }
-float gH(vec2 xz){ return textureLod(uTerH, xz / TILE, 0.0).b * TER_RANGE + TER_LO; }
+#define TOWN_N (7.0 * uTT / 320.0)    // the same density of towns and lamps on a larger tile
+#define LAMP_N (580.0 * uTT / 320.0)
+#define LC (uTT / LAMP_N)
+vec2 wrapd(vec2 v){ return mod(v + 0.5 * uTT, uTT) - 0.5 * uTT; }
+float gH(vec2 xz){ return textureLod(uTerH, xz / uTT, 0.0).b * TER_RANGE + TER_LO; }
 // a town in grid cell 'cell': centre, radius and street angle (radius 0: no town)
 vec4 townAt(vec2 cell){
   vec4 h = hash42(mod(cell, TOWN_N) * 1.31 + 7.7);
   if (h.x > 0.36) return vec4(0.0);
-  return vec4((cell + 0.2 + 0.6 * h.yz) * (TILE / TOWN_N), 2.5 + 5.5 * h.w * h.w, h.x * 23.0);
+  return vec4((cell + 0.2 + 0.6 * h.yz) * (uTT / TOWN_N), 2.5 + 5.5 * h.w * h.w, h.x * 23.0);
 }
 void main(){
-  vec2 xz = gl_FragCoord.xy / ${TER_N}.0 * TILE;
-  vec2 tc = floor(xz / (TILE / TOWN_N));
+  vec2 xz = gl_FragCoord.xy / ${TER_N}.0 * uTT;
+  vec2 tc = floor(xz / (uTT / TOWN_N));
   vec4 T[9];
   for (int k = 0; k < 9 + uZ; k++) T[k] = townAt(tc + vec2(float(k % 3) - 1.0, float(k / 3) - 1.0));
   float irr = 0.0, dots = 0.0;
@@ -819,7 +844,7 @@ ${LIGHTNING}
 // frame only finds where the ray meets the ground or a lake and adds the live parts:
 // the deck's shadow, the moon's glitter on the lakes, and fine texture up close.
 float terLod(float t){ return clamp(log2(max(t * uPixAngC, 1e-4) / TER_TEXEL), 0.0, 6.0); }
-float terY(vec2 xz, float lod){ return textureLod(uTerH, xz / TILE, lod).r * TER_RANGE + TER_LO; }
+float terY(vec2 xz, float lod){ return textureLod(uTerH, xz / uTT, lod).r * TER_RANGE + TER_LO; }
 vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
   float tW = (WATER_Y - ro.y) / rd.y;
   float t = max((uTerTop - ro.y) / rd.y, 0.0);
@@ -846,7 +871,7 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
   } else t = tW;
   tHit = t;
   vec3 po = ro + rd * t;
-  vec2 uv = po.xz / TILE;
+  vec2 uv = po.xz / uTT;
   float lod = terLod(t);
   vec4 A = textureLod(uTerA, uv, lod);
   // is the moon hidden from this spot by the deck above?
@@ -910,9 +935,9 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     if (float(m) >= uMastN) break;
     vec4 M = uMast[m];
     // the copy of this mast nearest where the ray passes it
-    vec2 mp = po.xz + mod(M.xy - po.xz + 0.5 * TILE, TILE) - 0.5 * TILE;
+    vec2 mp = po.xz + mod(M.xy - po.xz + 0.5 * uTT, uTT) - 0.5 * uTT;
     vec2 q = ro.xz + rd.xz * clamp(dot(mp - ro.xz, rd.xz) / rxz, 0.0, t);
-    mp = q + mod(M.xy - q + 0.5 * TILE, TILE) - 0.5 * TILE;
+    mp = q + mod(M.xy - q + 0.5 * uTT, uTT) - 0.5 * uTT;
     float sH = dot(mp - ro.xz, rd.xz) / rxz;          // where the ray passes the mast's line
     if (sH <= 0.0 || sH > t + 2.0) continue;          // behind the camera, or hidden by the ground
     float on = smoothstep(0.0, 0.04, fract(uTime * 0.5 + M.w)) * smoothstep(0.36, 0.26, fract(uTime * 0.5 + M.w));

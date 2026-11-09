@@ -70,7 +70,7 @@ export function PlaceTab() {
         {placeStatus === 'idle' && !place && 'Showing invented mountains. Search or pick a place to fly over real terrain.'}
       </div>
       <div style={{ marginTop: 8, fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
-        Terrain from open Terrarium elevation tiles; search by OpenStreetMap Nominatim. Lakes, towns and forests are still generated, not real.
+        Elevation: Terrarium (AWS Open Data). Colour: Sentinel-2 cloudless by EOX, contains modified Copernicus Sentinel data 2016 (CC BY 4.0). Search: OpenStreetMap Nominatim. Lakes and rivers are read from the satellite colour; town lights and small-scale detail are generated.
       </div>
 
       {map && createPortal(<MapPicker initial={place} onClose={() => setMap(false)}
