@@ -205,7 +205,7 @@ float densLight(float sd){ return clamp((sd + 0.1) * 1.3, 0.0, 1.0); }
 // Cloud shape at render time: the baked field (deck, heaps and cumulonimbus with their
 // large billows) plus one octave of finer live billowing for the small cauliflower detail.
 export const BAKED = `
-uniform sampler3D uBake, uBake2;   // the shape we are leaving and the shape we are growing into
+uniform sampler3D uBake, uBake2;   // cloud shape field: the one we are leaving and the one we are growing into
 uniform float uMorph;               // 0 = all uBake, 1 = all uBake2
 // Patches change at different moments (a smooth noise offsets the start of each), so some
 // clouds build or melt away before others instead of everything fading together.
@@ -214,16 +214,16 @@ float morphAt(vec3 p){
   float m = clamp(uMorph * 1.5 - 0.5 * n, 0.0, 1.0);
   return m * m * (3.0 - 2.0 * m);
 }
-vec4 bakeAt(vec3 uvw, vec3 p){
-  vec4 a = texture(uBake, uvw);
+float bakeAt(vec3 uvw, vec3 p){
+  float a = texture(uBake, uvw).r;
   if (uMorph <= 0.0) return a;
-  return mix(a, texture(uBake2, uvw), morphAt(p));
+  return mix(a, texture(uBake2, uvw).r, morphAt(p));
 }
 float bakedSD(vec3 p){
   float w = (p.y - Y_MIN) / (Y_MAX - Y_MIN);
   if (w >= 1.0) return -4.0 - (p.y - Y_MAX);
   if (w < 0.0) return -6.0;                  // below the deck: clear air down to the sea
-  return bakeAt(vec3(p.x / TILE, p.z / TILE, w), p).b * 16.0 - 10.0;
+  return bakeAt(vec3(p.x / TILE, p.z / TILE, w), p) * 16.0 - 10.0;
 }
 float shapeSD(vec3 p){
   float sd = bakedSD(p);
@@ -263,22 +263,37 @@ vec3 lightningAt(vec3 p){
 
 // Baked lighting: for every point of the tile, how much cloud lies between it
 // and the moon (R) and between it and the open sky above (G).
-export const BAKE_N = (DBG && DBG.bakeN) || 256, BAKE_NY = 96, BAKE_COLS = 8, BAKE_ROWS = 12;
-export const BAKE_FRAG = `
+// The cloud volume is baked in two parts, each rendered one layer at a time straight into a
+// 3D render target (no CPU round trip):
+//   shape: the signed distance field (cheap: one evaluation per voxel), at full resolution
+//   light: optical depth toward the moon and the sky (expensive: a long march per voxel),
+//          which is smooth, so it is baked at a much lower resolution
+export const SHAPE_N = 256, SHAPE_NY = 96;
+export const LIGHT_N = 128, LIGHT_NY = 64;
+export const BAKE_SHAPE_FRAG = `
 precision highp float;
 precision highp sampler3D;
 uniform sampler3D uNoise;
-uniform vec3 uMoonDir;
+uniform float uLayer;
 varying vec2 vUv;
 ${COMMON}
 ${WORLD}
 void main(){
-  vec2 px = gl_FragCoord.xy;
-  vec2 tile = floor(px / ${BAKE_N}.0);
-  float k = tile.y * ${BAKE_COLS}.0 + tile.x;
-  if (k >= ${BAKE_NY}.0){ gl_FragColor = vec4(0.0); return; }
-  vec2 ij = px - tile * ${BAKE_N}.0;
-  vec3 p = vec3(ij.x / ${BAKE_N}.0 * TILE, Y_MIN + (k + 0.5) / ${BAKE_NY}.0 * (Y_MAX - Y_MIN), ij.y / ${BAKE_N}.0 * TILE);
+  vec3 p = vec3(gl_FragCoord.x / ${SHAPE_N}.0 * TILE, Y_MIN + (uLayer + 0.5) / ${SHAPE_NY}.0 * (Y_MAX - Y_MIN), gl_FragCoord.y / ${SHAPE_N}.0 * TILE);
+  gl_FragColor = vec4(clamp((sceneSDFull(p) + 10.0) / 16.0, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+`;
+export const BAKE_LIGHT_FRAG = `
+precision highp float;
+precision highp sampler3D;
+uniform sampler3D uNoise;
+uniform vec3 uMoonDir;
+uniform float uLayer;
+varying vec2 vUv;
+${COMMON}
+${WORLD}
+void main(){
+  vec3 p = vec3(gl_FragCoord.x / ${LIGHT_N}.0 * TILE, Y_MIN + (uLayer + 0.5) / ${LIGHT_NY}.0 * (Y_MAX - Y_MIN), gl_FragCoord.y / ${LIGHT_N}.0 * TILE);
   float od = 0.0, ds = 0.12, tt = 0.0;
   for (int i = 0; i < 150; i++){
     vec3 q = p + uMoonDir * (tt + ds * 0.5);
@@ -292,8 +307,7 @@ void main(){
     up += densLight(sceneSD(q)) * ds;
     tt += ds; ds *= 1.15;
   }
-  // B: the cloud shape field itself, so rendering can read it instead of rebuilding it
-  gl_FragColor = vec4(1.0 - exp(-od * 0.25), 1.0 - exp(-up * 0.4), clamp((sceneSDFull(p) + 10.0) / 16.0, 0.0, 1.0), 1.0);
+  gl_FragColor = vec4(1.0 - exp(-od * 0.25), 1.0 - exp(-up * 0.4), 0.0, 1.0);
 }
 `;
 
@@ -468,6 +482,10 @@ precision highp float;
 precision highp sampler3D;
 uniform sampler3D uNoise;
 uniform sampler2D uTerH;
+// Always 0. It only keeps the loop bounds below from being compile-time constants: with constant
+// bounds the Windows (D3D) shader compiler unrolls these nested loops into a huge program and
+// takes minutes to compile it.
+uniform int uZ;
 varying vec2 vUv;
 ${COMMON}
 ${WORLD}
@@ -486,16 +504,16 @@ void main(){
   vec2 xz = gl_FragCoord.xy / ${TER_N}.0 * TILE;
   vec2 tc = floor(xz / (TILE / TOWN_N));
   vec4 T[9];
-  for (int k = 0; k < 9; k++) T[k] = townAt(tc + vec2(float(k % 3) - 1.0, float(k / 3) - 1.0));
+  for (int k = 0; k < 9 + uZ; k++) T[k] = townAt(tc + vec2(float(k % 3) - 1.0, float(k / 3) - 1.0));
   float irr = 0.0, dots = 0.0;
   vec2 lc0 = floor(xz / LC);
-  for (int j = -3; j <= 3; j++) for (int i = -3; i <= 3; i++){
+  for (int j = -3; j <= 3 + uZ; j++) for (int i = -3; i <= 3 + uZ; i++){
     vec2 lc = lc0 + vec2(float(i), float(j));
     vec3 lh = hash33(vec3(mod(lc, LAMP_N), 3.7));
     vec2 lp = (lc + 0.15 + 0.7 * lh.xy) * LC;
     // how likely a lamp is here: the towns' streets and houses, or a lone farmhouse
     float dens = 0.0015;
-    for (int k = 0; k < 9; k++){
+    for (int k = 0; k < 9 + uZ; k++){
       if (T[k].z <= 0.0) continue;
       vec2 d = wrapd(lp - T[k].xy);
       float r = length(d);
@@ -522,11 +540,11 @@ void main(){
   // (so each pair once), within 80 units. A road bows gently and wanders; its lamps,
   // about every 0.9 units with a few missing, stop over water and on steep ground, so a
   // road breaks where it crosses a lake or climbs a ridge.
-  for (int b = 0; b < 25; b++){
+  for (int b = 0; b < 25 + uZ; b++){
     vec2 cb = tc + vec2(float(b % 5) - 2.0, float(b / 5) - 2.0);
     vec4 TA = townAt(cb);
     if (TA.z <= 0.0) continue;
-    for (int e = 0; e < 4; e++){
+    for (int e = 0; e < 4 + uZ; e++){
       vec2 off = e == 0 ? vec2(1.0, -1.0) : e == 1 ? vec2(1.0, 0.0) : e == 2 ? vec2(1.0, 1.0) : vec2(0.0, 1.0);
       vec4 TB = townAt(cb + off);
       if (TB.z <= 0.0) continue;
@@ -543,7 +561,7 @@ void main(){
       if (abs(dot(pa, nrm) - c0) > 2.6) continue;               // too far from this road
       const float SP = 0.9;
       float i0 = floor((sp - 1.8) / SP);
-      for (int q = 0; q < 6; q++){
+      for (int q = 0; q < 6 + uZ; q++){
         float ls = (i0 + float(q)) * SP;
         if (ls < TA.z * 0.8 || ls > L - TB.z * 0.8) continue;   // inside a town the town's own lamps take over
         float hl = hash12(vec2(i0 + float(q), h * 91.0));
@@ -584,9 +602,12 @@ ${WORLD}
 ${BAKED}
 ${LIGHTNING}
 // optical depth toward the moon (x) and toward the sky above (y), from the bake
+uniform sampler3D uLight, uLight2;   // baked lighting (R: toward the moon, G: toward the sky), from / to
 vec2 baked(vec3 p){
-  vec4 b = bakeAt(vec3(p.x / TILE, p.z / TILE, (p.y - Y_MIN) / (Y_MAX - Y_MIN)), p);
-  return vec2(-log(max(1.0 - b.r, 2e-3)) * 4.0, -log(max(1.0 - b.g, 2e-3)) * 2.5);
+  vec3 uvw = vec3(p.x / TILE, p.z / TILE, (p.y - Y_MIN) / (Y_MAX - Y_MIN));
+  vec2 b = texture(uLight, uvw).rg;
+  if (uMorph > 0.0) b = mix(b, texture(uLight2, uvw).rg, morphAt(p));
+  return vec2(-log(max(1.0 - b.x, 2e-3)) * 4.0, -log(max(1.0 - b.y, 2e-3)) * 2.5);
 }
 // light reaching p: two crisp local samples, then the baked shadow beyond them.
 // Far away only the bake is read; between 55 and 80 units the two are blended.

@@ -5,7 +5,7 @@
 // their "off" defaults).
 import * as THREE from 'three'
 import {
-  VERT, COMMON, BAKE_FRAG, BAKE_N, TER_N, TER_H_FRAG, TER_L_FRAG, TER_T_FRAG,
+  VERT, COMMON, BAKE_SHAPE_FRAG, BAKE_LIGHT_FRAG, SHAPE_N, SHAPE_NY, LIGHT_N, LIGHT_NY, TER_N, TER_H_FRAG, TER_L_FRAG, TER_T_FRAG,
   CLOUD_FRAG, GROUND_FRAG, RAYS_FRAG, TAA_FRAG, COMPOSITE_FRAG,
 } from '../shaders/legacy'
 import { buildNoise } from './noise'
@@ -23,7 +23,8 @@ const copyCfg = (to: ReturnType<typeof cloudCfg>, from: ReturnType<typeof cloudC
   to.uDeckH.value = from.uDeckH.value; to.uWindV.value.copy(from.uWindV.value)
 }
 
-const BAKE_NY = 96, BAKE_COLS = 8, BAKE_ROWS = 12
+// layers baked per frame: while loading we can spend more of the frame, afterwards stay gentle
+const SHAPE_PER_FRAME = 24, LIGHT_PER_FRAME = 4, LIGHT_PER_FRAME_LOADING = 8
 const MOON_DIR = new THREE.Vector3(-0.2528, 0.2079, -0.9448).normalize()
 const MOON_R = 0.044
 const SPEED = 1.25
@@ -81,16 +82,22 @@ export class Engine {
   private cloudRT: THREE.WebGLRenderTarget | null = null
   private groundRT: any = null; private raysRT: any = null
   private histA: any = null; private histB: any = null; private carryHist: any = null
-  private fromTex: THREE.Data3DTexture   // shape on screen now
-  private toTex: THREE.Data3DTexture     // shape being grown into
-  private morphU = { uBake2: { value: null as any }, uMorph: { value: 0 } }
+  // cloud volumes: shape (distance field) and lighting, each as a "from" (on screen) and "to" (being grown into)
+  private shapeFrom: any; private shapeTo: any; private lightFrom: any; private lightTo: any
+  private morphU = { uBake: { value: null as any }, uBake2: { value: null as any }, uLight: { value: null as any }, uLight2: { value: null as any }, uMorph: { value: 0 } }
   private morphT = -1                    // seconds into a morph, -1 when none
   private morphDur = 12
   private pending: Clouds | null = null  // a change made during a morph, baked once it ends
   private cfgFrom: ReturnType<typeof cloudCfg>
   private lastMorphUI = -1
-  private bakePass: any; private bakeRT: THREE.WebGLRenderTarget; private bakeChunk = 0
-  private BAKE_CHUNKS = BAKE_ROWS * 4
+  private shapePass: any; private lightPass: any
+  private bakeActive = true; private bakeStage = 0; private bakeLayer = 0; private bakeStarted = 0
+  /** Millisecond timings, filled in when the page is opened with ?timing (adds a GPU sync per step). */
+  timings: Record<string, number> = {}
+  private TIMING = typeof location !== 'undefined' && /[?&]timing\b/.test(location.search)
+  private t0 = typeof performance !== 'undefined' ? performance.now() : 0
+  private tAdd(key: string, ms: number) { this.timings[key] = Math.round(((this.timings[key] ?? 0) + ms) * 10) / 10 }
+  private tMark(key: string) { if (this.timings[key] === undefined) this.timings[key] = Math.round(performance.now() - this.t0) }
   private terH: any; private terA: any; private terB: any; private terC: any; private terL: any
   private terHPass: any; private terTPass: any; private terLPass: any
   private terJobs: any[] = []
@@ -114,7 +121,9 @@ export class Engine {
     this.canFloat = ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float')
     this.RT_TYPE = this.canFloat ? THREE.HalfFloatType : THREE.UnsignedByteType
     this.USE_TAA = ext.has('EXT_color_buffer_float')
+    const tn = performance.now()
     const noiseTex = buildNoise(64)
+    this.timings.noiseBuildMs = Math.round(performance.now() - tn)
     const clouds0 = useSettings.getState().clouds
     this.lastClouds = clouds0
     this.cfgLive = cloudCfg(clouds0)
@@ -129,18 +138,19 @@ export class Engine {
       uTime: { value: 0 }, uFrame: { value: 0 },
     }
     const camU = this.camU
-    const bt = new THREE.Data3DTexture(new Uint8Array(BAKE_N * BAKE_N * BAKE_NY * 4), BAKE_N, BAKE_N, BAKE_NY)
-    bt.format = THREE.RGBAFormat; bt.type = THREE.UnsignedByteType
-    bt.minFilter = bt.magFilter = THREE.LinearFilter
-    bt.wrapS = bt.wrapT = THREE.RepeatWrapping; bt.wrapR = THREE.ClampToEdgeWrapping
-    bt.generateMipmaps = false; bt.unpackAlignment = 1
-    this.fromTex = bt
-    const bt2 = new THREE.Data3DTexture(new Uint8Array(BAKE_N * BAKE_N * BAKE_NY * 4), BAKE_N, BAKE_N, BAKE_NY)
-    bt2.format = bt.format; bt2.type = bt.type; bt2.minFilter = bt2.magFilter = THREE.LinearFilter
-    bt2.wrapS = bt2.wrapT = THREE.RepeatWrapping; bt2.wrapR = THREE.ClampToEdgeWrapping
-    bt2.generateMipmaps = false; bt2.unpackAlignment = 1
-    this.toTex = bt2
-    this.morphU.uBake2.value = bt2
+    // 3D render targets the bakes draw into one layer at a time (no CPU readback)
+    const mk3 = (n: number, nz: number, format: number) => {
+      const rt = new THREE.WebGL3DRenderTarget(n, n, nz, {
+        format, type: THREE.UnsignedByteType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+        depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
+      })
+      rt.texture.wrapS = rt.texture.wrapT = THREE.RepeatWrapping
+      rt.texture.wrapR = THREE.ClampToEdgeWrapping
+      return rt
+    }
+    this.shapeFrom = mk3(SHAPE_N, SHAPE_NY, THREE.RedFormat); this.shapeTo = mk3(SHAPE_N, SHAPE_NY, THREE.RedFormat)
+    this.lightFrom = mk3(LIGHT_N, LIGHT_NY, THREE.RGFormat); this.lightTo = mk3(LIGHT_N, LIGHT_NY, THREE.RGFormat)
+    this.syncVolumes()
     this.cfgFrom = cloudCfg(clouds0)
     this.morphDur = clouds0.speed
 
@@ -165,10 +175,10 @@ export class Engine {
     this.terL = makeTerRT(hf)
     const PACK = this.USE_TAA ? '#define PACK 1\n' : ''
     this.cloudPass = makePass(PACK + CLOUD_FRAG, Object.assign({
-      uNoise: { value: noiseTex }, uBake: { value: bt }, uNoClouds: { value: NOCLOUDS }, uDensity: { value: clouds0.density },
+      uNoise: { value: noiseTex }, uNoClouds: { value: NOCLOUDS }, uDensity: { value: clouds0.density },
     }, camU, this.lightU, cfgLive, this.morphU))
     this.groundPass = makePass(PACK + GROUND_FRAG, Object.assign({
-      uNoise: { value: noiseTex }, uBake: { value: bt }, tCloud: { value: null },
+      uNoise: { value: noiseTex }, tCloud: { value: null },
       uTerH: { value: this.terH.texture }, uTerA: { value: this.terA.texture }, uTerB: { value: this.terB.texture },
       uTerC: { value: this.terC.texture }, uTerL: { value: this.terL.texture }, uLamps: { value: 1 },
       uMast: { value: [0, 1, 2, 3].map(() => new THREE.Vector4()) }, uMastN: { value: 0 },
@@ -211,20 +221,18 @@ export class Engine {
     })
 
     // bakes
-    this.bakePass = makePass(BAKE_FRAG, Object.assign({ uNoise: { value: noiseTex }, uMoonDir: { value: MOON_DIR } }, this.cfgBake))
-    this.bakeRT = new THREE.WebGLRenderTarget(BAKE_N * BAKE_COLS, BAKE_N * BAKE_ROWS, {
-      type: THREE.UnsignedByteType, format: THREE.RGBAFormat, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-      depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
-    })
+    this.shapePass = makePass(BAKE_SHAPE_FRAG, Object.assign({ uNoise: { value: noiseTex }, uLayer: { value: 0 } }, this.cfgBake))
+    this.lightPass = makePass(BAKE_LIGHT_FRAG, Object.assign({ uNoise: { value: noiseTex }, uMoonDir: { value: MOON_DIR }, uLayer: { value: 0 } }, this.cfgBake))
+    this.bakeStarted = performance.now()
     this.terHPass = makePass(TER_H_FRAG, Object.assign({ uNoise: { value: noiseTex } }, cfgLive))
-    this.terTPass = makePass(TER_T_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture } }, cfgLive))
+    this.terTPass = makePass(TER_T_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uZ: { value: 0 } }, cfgLive))
     this.terLPass = makePass(TER_L_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uMoonDir: { value: MOON_DIR }, uMode: { value: 0 } }, cfgLive))
     const J = this.terJobs
-    for (let s = 0; s < 4; s++) J.push({ rt: this.terH, pass: this.terHPass, s, n: 4 })
-    for (let s = 0; s < 8; s++) J.push({ rt: this.terA, pass: this.terLPass, mode: 0, s, n: 8 })
-    for (let s = 0; s < 2; s++) J.push({ rt: this.terB, pass: this.terLPass, mode: 1, s, n: 2 })
-    for (let s = 0; s < 4; s++) J.push({ rt: this.terC, pass: this.terLPass, mode: 2, s, n: 4 })
-    for (let s = 0; s < 8; s++) J.push({ rt: this.terL, pass: this.terTPass, s, n: 8 })
+    for (let s = 0; s < 4; s++) J.push({ rt: this.terH, pass: this.terHPass, s, n: 4, label: 'H' })
+    for (let s = 0; s < 8; s++) J.push({ rt: this.terA, pass: this.terLPass, mode: 0, s, n: 8, label: 'A' })
+    for (let s = 0; s < 2; s++) J.push({ rt: this.terB, pass: this.terLPass, mode: 1, s, n: 2, label: 'B' })
+    for (let s = 0; s < 4; s++) J.push({ rt: this.terC, pass: this.terLPass, mode: 2, s, n: 4, label: 'C' })
+    for (let s = 0; s < 8; s++) J.push({ rt: this.terL, pass: this.terTPass, s, n: 8, label: 'T' })
 
     this.onPointer = (e) => {
       if ((e.target as HTMLElement)?.closest?.('[data-ui]')) return
@@ -248,8 +256,8 @@ export class Engine {
     this.unsub?.()
     clearTimeout(this.rebakeTimer)
     ;[this.cloudRT, this.groundRT, this.raysRT, this.histA, this.histB, this.carryHist,
-      this.terH, this.terA, this.terB, this.terC, this.terL].forEach((r) => r?.dispose())
-    for (const p of [this.cloudPass, this.groundPass, this.taaPass, this.raysPass, this.compPass, this.terHPass, this.terTPass, this.terLPass]) p?.mat.dispose()
+      this.terH, this.terA, this.terB, this.terC, this.terL, this.shapeFrom, this.shapeTo, this.lightFrom, this.lightTo].forEach((r) => r?.dispose())
+    for (const p of [this.cloudPass, this.groundPass, this.taaPass, this.raysPass, this.compPass, this.terHPass, this.terTPass, this.terLPass, this.shapePass, this.lightPass]) p?.mat.dispose()
   }
 
   private onCloudsChanged(c: Clouds, prev: Clouds) {
@@ -260,7 +268,7 @@ export class Engine {
     clearTimeout(this.rebakeTimer)
     // wait for the slider to settle, then bake the new shape in the background
     this.rebakeTimer = setTimeout(() => {
-      if (this.morphT >= 0 || this.bakeChunk !== Infinity) { this.pending = c; return } // finish the change in progress first
+      if (this.morphT >= 0 || this.bakeActive) { this.pending = c; return } // finish the change in progress first
       this.startBake(c)
     }, 350)
   }
@@ -268,7 +276,14 @@ export class Engine {
   private startBake(c: Clouds) {
     this.pending = null
     copyCfg(this.cfgBake, cloudCfg(c))
-    this.bakeChunk = 0
+    this.bakeActive = true; this.bakeStage = 0; this.bakeLayer = 0
+    this.bakeStarted = performance.now()
+  }
+
+  /** Point the shader uniforms at the current from/to volumes. */
+  private syncVolumes() {
+    this.morphU.uBake.value = this.shapeFrom.texture; this.morphU.uBake2.value = this.shapeTo.texture
+    this.morphU.uLight.value = this.lightFrom.texture; this.morphU.uLight2.value = this.lightTo.texture
   }
 
   applyGrade() {
@@ -321,41 +336,53 @@ export class Engine {
     this.compPass.u.uCloudTexel.value.set(this.USE_TAA ? 0 : 1 / cw, this.USE_TAA ? 0 : 1 / ch)
   }
 
-  // ---- baking (chunked across frames) ----
+  // ---- baking: a few layers per frame, straight into 3D render targets ----
   private bakeStep() {
-    const r = this.renderer
-    if (this.bakeChunk < this.BAKE_CHUNKS) {
-      const row = Math.floor(this.bakeChunk / 4), col = (this.bakeChunk % 4) * 2
-      this.bakeRT.scissor.set(col * BAKE_N, row * BAKE_N, BAKE_N * 2, BAKE_N)
-      this.bakeRT.scissorTest = true
-      r.setRenderTarget(this.bakeRT)
-      r.render(this.bakePass.scene, quadCam)
-      this.bakeChunk++
-      this.progress = (this.bakeChunk / this.BAKE_CHUNKS) * 0.6
-      if (this.baked) useSettings.setState({ rebake: this.bakeChunk / this.BAKE_CHUNKS })
-      return
-    }
-    const W = BAKE_N * BAKE_COLS, H = BAKE_N * BAKE_ROWS
-    const buf = new Uint8Array(W * H * 4)
-    r.readRenderTargetPixels(this.bakeRT, 0, 0, W, H, buf)
-    const dst = this.baked ? this.toTex : this.fromTex
-    const out = dst.image.data as Uint8Array, rowBytes = BAKE_N * 4
-    for (let k = 0; k < BAKE_NY; k++) {
-      const tx = k % BAKE_COLS, ty = Math.floor(k / BAKE_COLS)
-      for (let j = 0; j < BAKE_N; j++) {
-        const src = ((ty * BAKE_N + j) * W + tx * BAKE_N) * 4
-        out.set(buf.subarray(src, src + rowBytes), (k * BAKE_N + j) * rowBytes)
+    const r = this.renderer, gl = r.getContext(), first = !this.baked
+    const shapeRT = first ? this.shapeFrom : this.shapeTo
+    const lightRT = first ? this.lightFrom : this.lightTo
+    const t = this.TIMING ? performance.now() : 0
+    const stage = this.bakeStage
+    if (stage === 0) {
+      for (let i = 0; i < SHAPE_PER_FRAME && this.bakeLayer < SHAPE_NY; i++) {
+        this.shapePass.u.uLayer.value = this.bakeLayer
+        r.setRenderTarget(shapeRT, this.bakeLayer++)
+        r.render(this.shapePass.scene, quadCam)
+      }
+      if (this.bakeLayer >= SHAPE_NY) { this.bakeStage = 1; this.bakeLayer = 0 }
+    } else {
+      const per = first ? LIGHT_PER_FRAME_LOADING : LIGHT_PER_FRAME
+      for (let i = 0; i < per && this.bakeLayer < LIGHT_NY; i++) {
+        this.lightPass.u.uLayer.value = this.bakeLayer
+        r.setRenderTarget(lightRT, this.bakeLayer++)
+        r.render(this.lightPass.scene, quadCam)
       }
     }
-    dst.needsUpdate = true
-    this.bakeChunk = Infinity
+    if (this.TIMING) {
+      gl.finish()
+      const ms = performance.now() - t, key = stage === 0 ? 'bakeShape' : 'bakeLight'
+      if (this.timings[key + 'FirstStepMs'] === undefined) this.timings[key + 'FirstStepMs'] = Math.round(ms)
+      this.tAdd(key + 'Ms', ms)
+    }
+    const done = stage === 1 && this.bakeLayer >= LIGHT_NY
+    const frac = this.bakeStage === 0 ? (0.1 * this.bakeLayer) / SHAPE_NY : 0.1 + (0.9 * this.bakeLayer) / LIGHT_NY
+    this.progress = frac * 0.6
+    if (!first) useSettings.setState({ rebake: done ? -1 : frac })
+    if (done) this.finishBake()
+  }
+
+  private finishBake() {
+    this.bakeActive = false
+    this.renderer.setRenderTarget(null)
     if (this.baked) {
       // keep the old shape on screen and grow into the new one
+      this.timings.lastRebakeMs = Math.round(performance.now() - this.bakeStarted)
       copyCfg(this.cfgFrom, this.cfgLive)
       this.morphT = 0
       this.morphU.uMorph.value = 0.0001
       useSettings.setState({ rebake: -1, morph: 0 })
     } else {
+      this.tMark('cloudBakeDoneAt')
       copyCfg(this.cfgLive, this.cfgBake)
       copyCfg(this.cfgFrom, this.cfgLive)
     }
@@ -369,7 +396,10 @@ export class Engine {
       j.rt.scissor.set(0, j.s * h, TER_N, h)
       j.rt.scissorTest = true
       r.setRenderTarget(j.rt)
+      const tj = performance.now()
       r.render(j.pass.scene, quadCam)
+      this.tAdd('terrain_' + j.label + '_cpuMs', performance.now() - tj)
+      if (this.TIMING) { const g = r.getContext(); const t = performance.now(); g.finish(); this.tAdd('terrainSyncMs', performance.now() - t) }
       this.progress = 0.6 + 0.4 * (this.terJob / this.terJobs.length)
       return false
     }
@@ -467,8 +497,8 @@ export class Engine {
   /** Advance the simulation and draw one frame. `rawDt` in seconds. */
   step(rawDt: number) {
     if (!this.baked) {
-      if (this.bakeChunk !== Infinity) this.bakeStep()
-      else if (this.terrainStep()) { this.baked = true; this.progress = 1 }
+      if (this.bakeActive) this.bakeStep()
+      else if (this.terrainStep()) { this.baked = true; this.progress = 1; this.tMark('terrainDoneAt') }
       return
     }
     const dt = Math.min(rawDt, 0.1)
@@ -477,7 +507,7 @@ export class Engine {
     this.frame++
     this.updateMorph(dt)
     this.render()
-    if (this.bakeChunk !== Infinity) this.bakeStep() // background re-bake after a cloud-shape change
+    if (this.bakeActive) this.bakeStep() // background re-bake after a cloud-shape change
     this.adapt(rawDt)
     this.ready = this.frame > 2
   }
@@ -497,9 +527,9 @@ export class Engine {
     if (m - this.lastMorphUI >= 0.02 || m >= 1) { this.lastMorphUI = m; useSettings.setState({ morph: m >= 1 ? -1 : m }) }
     if (m >= 1) {
       // the new shape is now the whole picture: it is what we leave from next time
-      const t = this.fromTex; this.fromTex = this.toTex; this.toTex = t
-      this.cloudPass.u.uBake.value = this.fromTex; this.groundPass.u.uBake.value = this.fromTex
-      this.morphU.uBake2.value = this.toTex
+      let t = this.shapeFrom; this.shapeFrom = this.shapeTo; this.shapeTo = t
+      t = this.lightFrom; this.lightFrom = this.lightTo; this.lightTo = t
+      this.syncVolumes()
       this.morphU.uMorph.value = 0
       this.morphT = -1; this.lastMorphUI = -1
       if (this.pending) this.startBake(this.pending)
@@ -511,6 +541,7 @@ export class Engine {
 
   private render() {
     const r = this.renderer
+    const tr = this.TIMING && this.frame <= 3 ? performance.now() : 0
     const w = this.width, h = this.height, aspect = w / h
     const { camU, raysPass, compPass, groundPass, taaPass, cloudPass } = this
     const tanHalf = Math.max(Math.tan(THREE.MathUtils.degToRad(27.5)), 0.33 / aspect)
@@ -564,6 +595,7 @@ export class Engine {
     compPass.u.tRays.value = this.raysRT.texture
     r.setRenderTarget(null)
     r.render(compPass.scene, quadCam)
+    if (tr) { r.getContext().finish(); this.tAdd('firstFramesMs', performance.now() - tr); this.tMark('firstFrameAt') }
   }
 
   private adapt(rawDt: number) {

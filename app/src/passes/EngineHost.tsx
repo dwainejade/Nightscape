@@ -3,7 +3,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { Engine } from '../engine/engine'
 import { useSettings } from '../store/settings'
 
-declare global { interface Window { __cloudScene?: { advance: (dt: number) => void; settings: typeof useSettings } } }
+declare global { interface Window { __cloudScene?: { advance: (dt: number) => void; settings: typeof useSettings; timings: () => Record<string, number> } } }
 
 /** Owns the Engine and renders it each frame. A positive useFrame priority makes R3F skip its own render. */
 export function EngineHost({ onProgress }: { onProgress: (p: number) => void }) {
@@ -17,7 +17,7 @@ export function EngineHost({ onProgress }: { onProgress: (p: number) => void }) 
     const e = new Engine(gl)
     engine.current = e
     e.resize(size.width, size.height, dpr)
-    window.__cloudScene = { advance: (dt) => e.advance(dt), settings: useSettings }
+    window.__cloudScene = { advance: (dt) => e.advance(dt), settings: useSettings, timings: () => e.timings }
     return () => { e.dispose(); engine.current = null; delete window.__cloudScene }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gl])
