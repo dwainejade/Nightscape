@@ -622,6 +622,22 @@ void main(){
 }
 `;
 
+// Daytime sky colour (no sun disc, no dimming at night), shared by the sky and the ground.
+export const DAY_SKY = `
+vec3 daySkyBase(vec3 rd, vec3 s, float twi){
+  float y = max(rd.y, 0.0);
+  vec3 col = mix(vec3(0.60, 0.76, 0.98), vec3(0.09, 0.26, 0.72), pow(y, 0.45));
+  float cs = dot(rd, s);
+  col += vec3(1.0, 0.82, 0.55) * (0.30 * pow(max(cs, 0.0), 6.0) + 0.9 * pow(max(cs, 0.0), 64.0));
+  vec2 hd = normalize(rd.xz + 1e-5), sd = normalize(s.xz + 1e-5);
+  float az = max(dot(hd, sd), 0.0);
+  vec3 warm = mix(vec3(0.95, 0.40, 0.14), vec3(0.30, 0.20, 0.45), smoothstep(0.0, 0.5, y));
+  col = mix(col, warm * (0.25 + 0.75 * az * az), twi * 0.8 * exp(-y * 3.0) * (0.35 + 0.65 * az));
+  col = mix(col, col * vec3(0.45, 0.5, 0.75), twi * 0.4);
+  return col;
+}
+float daySkyScale(vec3 s){ return 0.04 + 0.96 * smoothstep(-0.15, 0.25, s.y); }
+`;
 export const CLOUD_FRAG = `
 precision highp float;
 precision highp sampler3D;
@@ -630,8 +646,11 @@ uniform float uDensity;   // cloud thickness (extinction); default 4.0
 uniform vec3 uCamPos, uCamR, uCamU, uCamF, uMoonDir;
 uniform float uTanHalf, uAspect, uTime, uFrame;
 uniform float uNoClouds;
+uniform vec3 uSunDir, uDayLift;   // shared with the composite: the sun, and what it multiplies the baked light by in daytime
+uniform float uDayAmt, uTwi;
 varying vec2 vUv;
 ${COMMON}
+${DAY_SKY}
 
 const vec3 MOON_COOL = vec3(0.74, 0.84, 1.00);
 const vec3 MOON_WARM = vec3(1.00, 0.88, 0.70);
@@ -657,6 +676,22 @@ vec2 lightAt(vec3 p, float t){
   float od = densLight(shapeSD(p + uMoonDir * 0.15)) * 0.3 + densLight(shapeSD(p + uMoonDir * 0.45)) * 0.3;
   vec2 b = baked(p + uMoonDir * 0.6);
   return mix(vec2(od + b.x, b.y), farL, f);
+}
+// Optical depth toward the sun. The bake only knows the moon's fixed direction, but the sun moves,
+// so this is read live from the baked shape: two crisp samples near the point (with the fine
+// detail), then six coarse ones out to ~36 units. (Same units and far-shadow fill-in as the bake.)
+float sunOd(vec3 p, float t){
+  vec3 d = uSunDir;
+  float od = 0.0;
+  if (t < 80.0) od += (densLight(shapeSD(p + d * 0.15)) + densLight(shapeSD(p + d * 0.45))) * 0.3;
+  else od += (densLight(bakedSD(p + d * 0.15)) + densLight(bakedSD(p + d * 0.45))) * 0.3;
+  od += densLight(bakedSD(p + d * 1.1)) * 1.00 * 0.978;
+  od += densLight(bakedSD(p + d * 2.4)) * 1.60 * 0.953;
+  od += densLight(bakedSD(p + d * 4.8)) * 3.20 * 0.908;
+  od += densLight(bakedSD(p + d * 9.2)) * 5.60 * 0.832;
+  od += densLight(bakedSD(p + d * 16.0)) * 8.00 * 0.726;
+  od += densLight(bakedSD(p + d * 28.0)) * 16.0 * 0.571;
+  return od;
 }
 
 float planeSpacing(float dz){
@@ -706,8 +741,22 @@ void main(){
   float ph1 = mix(hg(cosT, -0.11), hg(cosT, 0.42), 0.70);
   float ph2 = mix(hg(cosT, -0.05), hg(cosT, 0.20), 0.70);
   float backlit = smoothstep(0.35, 0.97, cosT);
-  vec3 fogC = skyBase(rd, uMoonDir) * 0.94;
-  const vec3 AIR_C = vec3(0.0060, 0.0112, 0.0245) * 0.94;   // the sky's plain horizon blue
+  // Daytime: the same shading with the sun as the light. The composite multiplies everything by
+  // uDayLift in daytime, so the day colours below are divided by it here.
+  vec3 invL = 1.0 / uDayLift;
+  float cosS = dot(rd, uSunDir);
+  float sph0 = mix(hg(cosS, -0.22), hg(cosS, 0.80), 0.70);
+  float sph1 = mix(hg(cosS, -0.11), hg(cosS, 0.42), 0.70);
+  float sph2 = mix(hg(cosS, -0.05), hg(cosS, 0.20), 0.70);
+  float backlitS = smoothstep(0.35, 0.97, cosS);
+  float sunUp = smoothstep(0.0, 0.4, uSunDir.y);
+  float skyS = daySkyScale(uSunDir);
+  vec3 sunCol = mix(vec3(1.0, 0.45, 0.2), vec3(1.0, 0.96, 0.88), sunUp) * smoothstep(0.0, 0.12, uSunDir.y);
+  vec3 ambLoD = vec3(0.16, 0.20, 0.30) * skyS;   // under a cloud: the dim light bounced up from the land
+  vec3 ambHiD = vec3(0.80, 0.98, 1.30) * skyS;   // on top: the open sky
+  vec3 fogC = mix(skyBase(rd, uMoonDir) * 0.94, daySkyBase(rd, uSunDir, uTwi) * skyS * 0.94 * invL, uDayAmt);
+  vec3 AIR_C = mix(vec3(0.0060, 0.0112, 0.0245) * 0.94,   // the sky's plain horizon blue
+                   daySkyBase(normalize(vec3(-uSunDir.x, 0.1, -uSunDir.z)), uSunDir, uTwi) * skyS * 0.94 * invL, uDayAmt);
 
   float jit = ign(gl_FragCoord.xy + mod(uFrame, 64.0) * 5.588238);
   vec3 S = vec3(0.0);
@@ -720,6 +769,7 @@ void main(){
   float t = planar ? nextPlaneT(ro.z, rz, 0.05) : 0.05 + jit * 0.22;
   float SIG = uDensity;   // extinction; live setting
   const float MOON_I = 3.1;
+  const float SUN_D = 44.0;   // the sun, as it should look on screen (the moonlit clouds were 3.1 x 14 = 43)
   const float RAMP_K = 0.5;   // how strongly distant cloud edges soften (0 = not at all)
   vec3 lightCol = mix(MOON_COOL, MOON_WARM, smoothstep(0.55, 0.985, cosT));
 
@@ -775,15 +825,27 @@ void main(){
       d *= 1.0 - smoothstep(tFar - 45.0, tFar - 4.0, t);
     }
     if (d > 0.004){
-      vec2 lt = lightAt(p, t);
-      float od = lt.x;
-      float e = ph0 * exp(-od * SIG) + 0.34 * ph1 * exp(-od * SIG * 0.40) + 0.14 * ph2 * exp(-od * SIG * 0.17);
+      // by day only the sky-above part of the bake is needed; the moon's shadows are skipped
+      vec2 lt = uDayAmt < 0.999 ? lightAt(p, t) : vec2(0.0, baked(p).y);
       float powder = 1.0 - exp(-max(sd, 0.0) * 2.6 - d * 0.5);
-      float pf = mix(mix(0.42, 1.0, powder), 1.0, backlit);
       float hgt = clamp((p.y + 6.0) / 15.0, 0.0, 1.0);
       float occ = exp(-max(sd, 0.0) * 0.5) * mix(0.15, 1.0, exp(-lt.y * 0.5));
-      vec3 amb = mix(AMB_LO, AMB_HI, sqrt(hgt)) * (0.28 + 0.72 * occ);
-      vec3 L = lightCol * (MOON_I * e * pf) + amb;
+      vec3 Lm = vec3(0.0), Ls = vec3(0.0);
+      if (uDayAmt < 0.999){
+        float od = lt.x;
+        float e = ph0 * exp(-od * SIG) + 0.34 * ph1 * exp(-od * SIG * 0.40) + 0.14 * ph2 * exp(-od * SIG * 0.17);
+        float pf = mix(mix(0.42, 1.0, powder), 1.0, backlit);
+        vec3 amb = mix(AMB_LO, AMB_HI, sqrt(hgt)) * (0.28 + 0.72 * occ);
+        Lm = lightCol * (MOON_I * e * pf) + amb;
+      }
+      if (uDayAmt > 0.001){
+        float odS = sunOd(p, t);
+        float eS = sph0 * exp(-odS * SIG) + 0.34 * sph1 * exp(-odS * SIG * 0.40) + 0.14 * sph2 * exp(-odS * SIG * 0.17);
+        float pfS = mix(mix(0.42, 1.0, powder), 1.0, backlitS);
+        vec3 ambS = mix(ambLoD, ambHiD, sqrt(hgt)) * (0.28 + 0.72 * occ);
+        Ls = (sunCol * (SUN_D * eS * pfS) + ambS) * invL;
+      }
+      vec3 L = mix(Lm, Ls, uDayAmt);
       if (uFlash > 0.0) L += lightningAt(p);
       float fogA = 1.0 - exp(-t * 0.016 * mix(1.0, 0.3, smoothstep(4.0, 30.0, p.y)));
       // Up close the air is a plain night blue. The sky's colour in this direction (its
@@ -803,7 +865,7 @@ void main(){
   bool ground = rd.y < 0.0 && t >= tMax && T > 0.003 && ((Y_MIN - ro.y) / rd.y <= 200.0 || uNoClouds > 0.5);
   // The cloud sea continues past the march distance: fill the far horizon with haze.
   float far = ground ? 0.0 : smoothstep(-0.002, -0.03, rd.y);
-  vec3 farC = mix(fogC * vec3(0.40, 0.44, 0.52), fogC * 0.8, smoothstep(-0.05, -0.002, rd.y));
+  vec3 farC = mix(fogC * mix(vec3(0.40, 0.44, 0.52), vec3(0.85, 0.90, 0.96), uDayAmt), fogC * 0.8, smoothstep(-0.05, -0.002, rd.y));   // (the dark band low on the horizon is much lighter by day)
   S += T * farC * far;
   dSum += T * far * 250.0; wSum += T * far;
   T *= 1.0 - far;
@@ -831,6 +893,8 @@ uniform float uLamps;   // panel: how bright the town lights are
 uniform vec4 uMast[4];  // radio masts on summits: x, z, base height, flash phase
 uniform float uMastN;
 uniform float uTerTop, uPixAngC, uNoClouds;
+uniform vec3 uSunDir, uDayLift;   // shared with the composite
+uniform float uDayAmt, uTwi;
 varying vec2 vUv;
 ${COMMON}
 ${TERRAIN_COMMON}
@@ -839,6 +903,7 @@ const vec3 MOON_WARM = vec3(1.00, 0.88, 0.70);
 ${WORLD}
 ${BAKED}
 ${LIGHTNING}
+${DAY_SKY}
 // The flooded mountains below the deck. Everything that doesn't change is baked
 // (height, canopy, moonlight and its shadows, sky visibility, colour, horizons), so a
 // frame only finds where the ray meets the ground or a lake and adds the live parts:
@@ -885,6 +950,24 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
   vec3 alb = textureLod(uTerB, uv, lod).rgb;
   alb *= alb;
   vec3 col;
+  // Daylight. The baked light is the moon's, so by day the ground is lit here instead: the sun on
+  // the slope, shadowed by the land itself and by the cloud deck, plus the sky as ambient light.
+  // (The composite multiplies everything by uDayLift in daytime, so that is divided out below.)
+  vec3 dayCol = vec3(0.0);
+  float sunUp = smoothstep(0.0, 0.4, uSunDir.y);
+  float skyS = daySkyScale(uSunDir);
+  vec3 sunC = mix(vec3(1.0, 0.45, 0.2), vec3(1.0, 0.95, 0.84), sunUp) * 3.2 * smoothstep(0.0, 0.12, uSunDir.y);
+  vec3 amb = vec3(0.0);
+  float sOpen = 1.0;
+  if (uDayAmt > 0.001){
+    amb = mix(daySkyBase(vec3(0.0, 1.0, 0.0), uSunDir, uTwi),
+              daySkyBase(normalize(vec3(-uSunDir.x, 0.15, -uSunDir.z)), uSunDir, uTwi), 0.4) * skyS * 0.9;
+    if (uSunDir.y > 0.05){
+      vec3 pcs = po + uSunDir * ((CLOUD_BASE + 1.0 - po.y) / uSunDir.y);
+      float aS = texture(uNoise, vec3(pcs.xz * F_A, 0.137)).b;
+      sOpen = 1.0 - smoothstep(0.42, 0.52, coverageAt(pcs.xz, aS));
+    }
+  }
   if (land){
     // tree crowns and rock grain finer than the bake, fading out with distance
     float fine = texture(uNoise, vec3(po.xz * 0.8, 0.37)).g;
@@ -893,6 +976,25 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     // the towns' warm street lights and the pools of light they throw (baked)
     vec2 L = textureLod(uTerL, uv, lod).rg;
     col += LAMP_C * uLamps * (alb * L.x * 1.3 + L.y * 0.6);
+    if (uDayAmt > 0.001){
+      float e = TER_TEXEL * 1.5;
+      vec3 nrm = normalize(vec3(terY(po.xz - vec2(e, 0.0), lod) - terY(po.xz + vec2(e, 0.0), lod), 2.0 * e,
+                                terY(po.xz - vec2(0.0, e), lod) - terY(po.xz + vec2(0.0, e), lod)));
+      float ndl = max(dot(nrm, uSunDir), 0.0);
+      float sh = 1.0;
+      if (uSunDir.y > 0.02 && ndl > 0.0){
+        float s = 0.4;
+        for (int i = 0; i < 26; i++){
+          vec3 q = po + uSunDir * s;
+          if (q.y > uTerTop) break;
+          sh = min(sh, 6.0 * (q.y - terY(q.xz, lod + 1.5)) / s);
+          if (sh < 0.0) break;
+          s = s * 1.16 + 0.3;
+        }
+        sh = smoothstep(0.0, 1.0, clamp(sh, 0.0, 1.0));
+      }
+      dayCol = alb * (sunC * ndl * sh * mix(0.12, 1.0, sOpen) + amb * A.g);
+    }
   } else {
     // A lake. From this high up the ripples are far smaller than a pixel, so the water
     // is shaded as a smooth mirror that is slightly rough: the moon's reflection spreads
@@ -923,6 +1025,18 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     col = below * (1.0 - fres) + refl * fres + MOON_WARM * 0.0035 * D * fh / cv * moonSeen;
     // a lake beside a lit town catches its warm glow (the lamps' light, blurred out)
     col += LAMP_C * uLamps * textureLod(uTerL, uv, lod + 3.0).x * 0.10 * (0.35 + fres);
+    if (uDayAmt > 0.001){
+      // by day the water mirrors the sky, with the sun's glitter path, over a dark body of water
+      vec3 skyD = daySkyBase(r, uSunDir, uTwi) * skyS;
+      vec3 reflD = mix(skyD, vec3(0.020, 0.032, 0.028) * (0.3 + 0.7 * sunUp), mtn);
+      vec3 hvS = normalize(uSunDir - rd);
+      float nhS = hvS.y;
+      float DS = a2 / (3.14159 * pow(nhS * nhS * (a2 - 1.0) + 1.0, 2.0));
+      float fhS = 0.02 + 0.98 * pow(1.0 - max(dot(hvS, -rd), 0.0), 5.0);
+      float sunSeen = sOpen * (1.0 - mtn) * step(0.0, uSunDir.y);
+      vec3 bodyD = vec3(0.012, 0.040, 0.060) * (0.25 + 0.75 * sunUp) + alb * (sunC * 0.35 * sunUp + amb) * 0.45 * exp(-max(depth, 0.0) * 1.6);
+      dayCol = bodyD * (1.0 - fres) + reflD * fres + sunC * 0.0045 * DS * fhS / cv * sunSeen;
+    }
   }
   // Radio masts on a few summits: a thin dark lattice with red aircraft warning lights,
   // a flashing beacon on top and a steady light halfway up. A handful of analytic tests
@@ -966,7 +1080,7 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     }
   }
   // the dim air between deck and ground
-  float haze = 1.0 - exp(-(t - (Y_MIN - ro.y) / rd.y) * 0.0028);
+  float haze = 1.0 - exp(-(t - (Y_MIN - ro.y) / rd.y) * mix(0.0028, 0.0009, uDayAmt));   // clearer air by day
   vec3 hazeC = vec3(0.0030, 0.0052, 0.0115) + MOON_COOL * 0.010 * pow(max(cosT, 0.0), 6.0);
   vec3 glow = vec3(0.0);
   if (uFlash > 0.0){
@@ -977,6 +1091,10 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     vec3 v = segPoint(pm, uLa1, uLb1) - pm;
     glow = LCOL * uLi1 * 0.03 / (1.0 + dot(v, v) * 0.008);
   }
+  // by day, the ground and its haze are lit here: divide out what the composite will multiply back
+  vec3 invL = 1.0 / uDayLift;
+  col = mix(col, dayCol * invL, uDayAmt);
+  hazeC = mix(hazeC, daySkyBase(normalize(vec3(rd.x, 0.02, rd.z)), uSunDir, uTwi) * skyS * invL, uDayAmt);
   return mix(col, hazeC, haze * 0.8) + glow + beacons;
 }
 
@@ -1124,8 +1242,10 @@ uniform vec3 uConA, uConB;   // its contrail as a straight segment, oldest end t
 uniform vec4 uCon;           // the contrail's age at A and at B (seconds), its fade time, its brightness
 uniform float uGlitter;      // how much the contrail's ice crystals glint
 uniform sampler2D uMoonMap;
+uniform float uMoonPhase;   // 0 new, 0.25 first quarter, 0.5 full, 0.75 last quarter
 uniform vec3 uBalance, uShadowTint, uHighTint, uSunDir;
-uniform float uDayAmt, uNightAmt, uTwi;   // day/night cycle: how much day, how much night (stars, moon), how much twilight
+uniform float uDayAmt, uNightAmt, uTwi;
+uniform vec3 uDayLift;   // what the baked light is multiplied by in daytime (the ground divides this out)   // day/night cycle: how much day, how much night (stars, moon), how much twilight
 uniform float uShadowAmt, uHighAmt, uLift, uSat, uContrast, uVignette, uGrain, uRays;
 varying vec2 vUv;
 ${COMMON}
@@ -1287,6 +1407,25 @@ vec3 aircraft(vec3 rd){
   return col * mix(0.5, 1.0, smoothstep(0.02, 0.15, rd.y));   // dimmer low down, through more air
 }
 
+// How much of the disc point with surface normal n (x right, z toward us) the sun lights;
+// a wide, soft falloff, since the terminator on the real Moon is gradual.
+float moonLit(vec3 n){
+  float pa = uMoonPhase * 6.2831853;
+  vec3 L = vec3(sin(pa), 0.0, -cos(pa));
+  float d = dot(n, L);
+  float t = smoothstep(-0.04, 0.55, d);
+  return t * t * (1.0 + 0.5 * (1.0 - t));   // eases in at the terminator
+}
+
+// 0 on the dark side of the disc, 1 on the lit side (for letting the sky show through the dark part)
+float moonLitAt(vec3 rd, vec3 m){
+  vec3 mr = normalize(cross(m, vec3(0.0, 1.0, 0.0)));
+  vec3 mu = cross(mr, m);
+  vec2 uv = vec2(dot(rd, mr), dot(rd, mu)) / uMoonR;
+  float r = min(length(uv), 1.0);
+  return clamp(moonLit(vec3(uv, sqrt(1.0 - r * r))), 0.0, 1.0);
+}
+
 vec3 moonDisk(vec3 rd, vec3 m){
   float c = dot(rd, m);
   if (c < 0.9) return vec3(0.0);
@@ -1304,23 +1443,23 @@ vec3 moonDisk(vec3 rd, vec3 m){
   float alb = mix(0.85, pow(m0, 1.2) * 1.75, uMoonReady);
   float limb = 0.88 + 0.12 * pow(n.z, 0.6);
   vec3 tint = mix(vec3(1.00, 0.82, 0.60), vec3(1.0, 0.93, 0.80), n.z);
-  return tint * alb * limb * edge * 1.3;
+  // phase: the sun's direction in the disc's frame (x right, z toward us); waxing is lit on the right
+  float pa = uMoonPhase * 6.2831853;
+  vec3 L = vec3(sin(pa), 0.0, -cos(pa));
+  float lit = moonLit(n);
+  // the unlit side shows only a faint, cool earthshine, close to the sky around it
+  vec3 earth = vec3(0.55, 0.68, 1.0) * alb * 0.004;
+  return mix(earth * edge, tint * alb * limb * edge * 1.3, lit);
 }
 
 // Daytime sky: blue gradient, sun glow and disc, and a warm band toward the sun at dawn and dusk.
+${DAY_SKY}
 vec3 daySky(vec3 rd, vec3 s){
-  float y = max(rd.y, 0.0);
-  vec3 col = mix(vec3(0.60, 0.76, 0.98), vec3(0.09, 0.26, 0.72), pow(y, 0.45));
+  vec3 col = daySkyBase(rd, s, uTwi);
   float cs = dot(rd, s);
-  col += vec3(1.0, 0.82, 0.55) * (0.30 * pow(max(cs, 0.0), 6.0) + 0.9 * pow(max(cs, 0.0), 64.0));
-  vec2 hd = normalize(rd.xz + 1e-5), sd = normalize(s.xz + 1e-5);
-  float az = max(dot(hd, sd), 0.0);
-  vec3 warm = mix(vec3(0.95, 0.40, 0.14), vec3(0.30, 0.20, 0.45), smoothstep(0.0, 0.5, y));
-  col = mix(col, warm * (0.25 + 0.75 * az * az), uTwi * 0.8 * exp(-y * 3.0) * (0.35 + 0.65 * az));
-  col = mix(col, col * vec3(0.45, 0.5, 0.75), uTwi * 0.4);
   float a = acos(clamp(cs, -1.0, 1.0));
   col += vec3(1.0, 0.95, 0.85) * 40.0 * (1.0 - smoothstep(0.0085, 0.0105, a));   // the sun's disc
-  return col * (0.04 + 0.96 * smoothstep(-0.15, 0.25, s.y));
+  return col * daySkyScale(s);
 }
 
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
@@ -1348,13 +1487,21 @@ void main(){
   if (rd.y > 0.0 && rd.y < 0.3 && c.a > 0.0) st += heroStars(rd) * smoothstep(0.0, 0.015, rd.y) * smoothstep(0.03, 0.2, am);
   if (uMet.w > 0.0 && rd.y > 0.0 && c.a > 0.0) st += meteor(rd) * smoothstep(0.0, 0.03, rd.y);
   if (uAirOn > 0.0 && rd.y > 0.0 && c.a > 0.0) st += aircraft(rd) * smoothstep(0.0, 0.02, rd.y);
-  vec3 night = skyBase(rd, m) * (1.0 - 0.82 * diskMask) + st + moonDisk(rd, m) * uNightAmt;
+  // the halo is hidden behind the lit part of the disc only; the dark part lets the sky through
+  float hide = diskMask > 0.0 ? diskMask * mix(0.3, 0.82, moonLitAt(rd, m)) : 0.0;
+  // the glow around the moon is the light of its lit part, so it fades as the moon thins
+  float illumH = 0.5 - 0.5 * cos(uMoonPhase * 6.2831853);
+  float haloK = mix(0.10, 1.0, illumH * illumH);
+  vec3 halo = vec3(0.30, 0.46, 0.90) * 0.0035 * exp(-am * 2.4) + vec3(0.55, 0.66, 0.88) * 0.0150 * exp(-am * 8.5)
+            + vec3(1.00, 0.90, 0.74) * 0.1100 * exp(-am * 28.0) + vec3(1.00, 0.93, 0.80) * 0.4500 * exp(-am * 90.0);
+  vec3 night = (skyBase(rd, m) - halo * (1.0 - haloK)) * (1.0 - hide) + st + moonDisk(rd, m) * uNightAmt;
   vec3 sky = mix(night, daySky(rd, uSunDir), uDayAmt);
   // the clouds and ground are lit by the baked moonlight; in daytime lift and warm them toward the sun
-  float sunUp = smoothstep(0.0, 0.4, uSunDir.y);
-  vec3 sunTint = mix(vec3(1.0, 0.55, 0.32), vec3(1.0, 0.97, 0.92), sunUp);
-  vec3 lit = c.rgb * sunTint * (14.0 * (0.2 + 0.8 * sunUp));
-  vec3 col = mix(c.rgb, lit, uDayAmt) + sky * c.a;
+  vec3 lit = c.rgb * uDayLift;
+  // less light on the clouds and ground around a new moon
+  float illum = 0.5 - 0.5 * cos(uMoonPhase * 6.2831853);
+  vec3 cn = c.rgb * mix(1.0, mix(0.3, 1.0, illum), uNightAmt);
+  vec3 col = mix(cn, lit, uDayAmt) + sky * c.a;
   // lightning: the bolt itself (already hidden by the clouds in front of it), and a
   // faint brightening of the open air around the flash
   if (uBoltOn > 0.0) col += texture2D(tBolt, vUv).rgb * 32.0;

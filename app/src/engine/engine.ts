@@ -135,6 +135,18 @@ export class Engine {
   private unsub: () => void
   private onPointer: (e: PointerEvent) => void
   private onLeave: () => void
+  // free-fly camera
+  private manual = false
+  private lastDt = 0
+  private fly = { x: 0, y: 3.6, z: 0, yaw: 0, pitch: 0, vx: 0, vy: 0, vz: 0 }
+  private keys = new Set<string>()
+  private dragging = false
+  private onDown: (e: PointerEvent) => void
+  private onUp: () => void
+  private onDragMove: (e: PointerEvent) => void
+  private onKeyDown: (e: KeyboardEvent) => void
+  private onKeyUp: (e: KeyboardEvent) => void
+  private onBlur: () => void
 
   constructor(renderer: THREE.WebGLRenderer) {
     this.renderer = renderer
@@ -226,17 +238,20 @@ export class Engine {
       uPixAng: { value: 0.001 }, uMoonR: { value: MOON_R }, uExposure: { value: 1.12 },
       uTwinkle: { value: 1 }, uStarLow: { value: 0.035 },
       uMetA: { value: new THREE.Vector3(0, 0, 1) }, uMetB: { value: new THREE.Vector3(0, 0.1, 1) }, uMet: { value: new THREE.Vector4(0, 0, 0, 0) },
-      uMoonMap: { value: null }, uMoonReady: { value: 0 },
+      uMoonMap: { value: null }, uMoonReady: { value: 0 }, uMoonPhase: { value: 0.5 },
       uBalance: { value: new THREE.Vector3(1, 1, 1) }, uShadowTint: { value: new THREE.Vector3(1, 1, 1) },
       uHighTint: { value: new THREE.Vector3(1, 1, 1) }, uShadowAmt: { value: 0 }, uHighAmt: { value: 0 },
       uLift: { value: 0 }, uSat: { value: 1 }, uContrast: { value: 1 }, uVignette: { value: 0.38 },
       uGrain: { value: 0.007 }, uRays: { value: 1 },
       tBolt: { value: null }, uBoltOn: { value: 0 }, uSkyFlash: { value: V3() }, uFlashDir: { value: new THREE.Vector3(0, 1, 0) },
       uFar: { value: new THREE.Vector4(0, 0, -1, 0) }, uFarShape: { value: new THREE.Vector3(0.1, 0, 0.04) }, uFarCol: { value: new THREE.Vector4(1, 0.84, 0.74, 1) },
-      uSunDir: { value: new THREE.Vector3(1, -1, 0) }, uDayAmt: { value: 0 }, uNightAmt: { value: 1 }, uTwi: { value: 0 },
+      uSunDir: { value: new THREE.Vector3(1, -1, 0) }, uDayAmt: { value: 0 }, uNightAmt: { value: 1 }, uTwi: { value: 0 }, uDayLift: { value: new THREE.Vector3(1, 1, 1) },
       uAirOn: { value: 0 }, uAirW: { value: new THREE.Vector3(0, 1, 0) }, uAirR: { value: new THREE.Vector3(0, 1, 0) }, uAirG: { value: new THREE.Vector3(0, 1, 0) },
       uAirI: { value: V3() }, uConA: { value: V3() }, uConB: { value: V3() }, uCon: { value: new THREE.Vector4(0, 0, 150, 0) }, uGlitter: { value: 1 },
     }, camU, cfgLive))
+
+    // the ground is lit by the sun itself in daytime, with the same sun the sky uses
+    for (const k of ['uSunDir', 'uDayAmt', 'uTwi', 'uDayLift']) { this.groundPass.u[k] = this.compPass.u[k]; this.cloudPass.u[k] = this.compPass.u[k] }
 
     new THREE.TextureLoader().load(`${import.meta.env.BASE_URL}moon-lroc-512.jpg`, (tex) => {
       tex.wrapS = THREE.RepeatWrapping
@@ -269,8 +284,36 @@ export class Engine {
     window.addEventListener('pointermove', this.onPointer)
     document.addEventListener('pointerleave', this.onLeave)
 
+    const isUI = (t: EventTarget | null) => !!(t as HTMLElement)?.closest?.('[data-ui]')
+    const isField = (t: EventTarget | null) => /^(INPUT|TEXTAREA|SELECT)$/.test((t as HTMLElement)?.tagName ?? '')
+    this.onDown = (e) => { if (e.button === 0 && !isUI(e.target)) { this.dragging = true; this.setManual(true) } }
+    this.onUp = () => { this.dragging = false }
+    this.onDragMove = (e) => {
+      if (!this.dragging || !this.manual) return
+      const f = this.fly
+      f.yaw -= e.movementX * 0.003 // grab the world: drag right, the view turns left
+      f.pitch = THREE.MathUtils.clamp(f.pitch + e.movementY * 0.003, -1.5, 1.5)
+    }
+    this.onKeyDown = (e) => {
+      if (isField(e.target) || e.ctrlKey || e.metaKey || e.altKey) return
+      const k = e.key.toLowerCase()
+      if ('wasdqe'.includes(k) && k.length === 1) { this.keys.add(k); this.setManual(true); e.preventDefault() }
+      else if (k === 'shift') this.keys.add('shift')
+      else if (k === 'r') this.setManual(false)
+    }
+    this.onKeyUp = (e) => this.keys.delete(e.key.toLowerCase())
+    this.onBlur = () => { this.keys.clear(); this.dragging = false }
+    window.addEventListener('pointerdown', this.onDown)
+    window.addEventListener('pointerup', this.onUp)
+    window.addEventListener('pointercancel', this.onUp)
+    window.addEventListener('pointermove', this.onDragMove)
+    window.addEventListener('keydown', this.onKeyDown)
+    window.addEventListener('keyup', this.onKeyUp)
+    window.addEventListener('blur', this.onBlur)
+
     this.applyGrade()
     this.unsub = useSettings.subscribe((st) => {
+      if (st.manual !== this.manual) this.setManual(st.manual)
       this.applyGrade()
       if (st.tod !== this.tod) this.tod = st.tod // moved from the panel
       if (st.place !== this.lastPlace) { const p = st.place; this.lastPlace = p; void this.loadPlace(p) }
@@ -281,6 +324,13 @@ export class Engine {
   dispose() {
     window.removeEventListener('pointermove', this.onPointer)
     document.removeEventListener('pointerleave', this.onLeave)
+    window.removeEventListener('pointerdown', this.onDown)
+    window.removeEventListener('pointerup', this.onUp)
+    window.removeEventListener('pointercancel', this.onUp)
+    window.removeEventListener('pointermove', this.onDragMove)
+    window.removeEventListener('keydown', this.onKeyDown)
+    window.removeEventListener('keyup', this.onKeyUp)
+    window.removeEventListener('blur', this.onBlur)
     this.unsub?.()
     clearTimeout(this.rebakeTimer)
     ;[this.cloudRT, this.groundRT, this.raysRT, this.histA, this.histB, this.carryHist,
@@ -421,6 +471,7 @@ export class Engine {
     u.uShadowAmt.value = g.shadowAmt; u.uHighAmt.value = g.highAmt
     u.uLift.value = g.lift; u.uSat.value = g.sat; u.uContrast.value = g.contrast
     u.uVignette.value = g.vignette; u.uGrain.value = g.grain; u.uRays.value = g.rays
+    u.uMoonPhase.value = useSettings.getState().moonPhase
   }
 
   /** Sun position and day/night weights from the time of day (6 = sunrise in the east, 12 = high noon, 18 = sunset). */
@@ -435,6 +486,9 @@ export class Engine {
     u.uDayAmt.value = day
     u.uNightAmt.value = 1 - sm(-0.2, -0.02, y)
     u.uTwi.value = 1 - sm(0.0, 0.4, Math.abs(y + 0.04))
+    // what the composite multiplies the baked light by in daytime (warm and dim near the horizon)
+    const sunUp = sm(0.0, 0.4, y), gain = 14 * (0.2 + 0.8 * sunUp)
+    u.uDayLift.value.set(gain * 1.0, gain * (0.55 + 0.42 * sunUp), gain * (0.32 + 0.60 * sunUp))
     this.groundPass.u.uLamps.value = 1 - 0.95 * sm(-0.1, 0.12, y)
   }
 
@@ -605,8 +659,53 @@ export class Engine {
 
   // ---- camera ----
   private _f = new THREE.Vector3(); private _r = new THREE.Vector3(); private _u = new THREE.Vector3(); private _up = new THREE.Vector3()
-  private updateCamera(t: number, aspect: number) {
+  /** Switch between the automatic path and free flight, continuing from where the camera is. */
+  private setManual(on: boolean) {
+    if (on === this.manual) return
+    this.manual = on
+    const f = this.fly
+    if (on) {
+      const p = this.camU.uCamPos.value, d = this.camU.uCamF.value
+      f.x = p.x; f.y = p.y; f.z = p.z
+      f.yaw = Math.atan2(d.x, -d.z); f.pitch = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1))
+      f.vx = f.vy = f.vz = 0
+    } else {
+      this.simT = -f.z / SPEED // rejoin the path at the current point along it
+      this.keys.clear(); this.dragging = false
+      this.taaPass.u.uReset.value = 1
+    }
+    if (useSettings.getState().manual !== on) useSettings.setState({ manual: on })
+  }
+
+  private updateFly(dt: number) {
+    const f = this.fly, k = this.keys
+    const cp = Math.cos(f.pitch), sp = Math.sin(f.pitch), sy = Math.sin(f.yaw), cy = Math.cos(f.yaw)
+    const fx = sy * cp, fy = sp, fz = -cy * cp // forward, wherever the camera points
+    const rx = cy, rz = sy                     // right, level
+    const fwd = (k.has('w') ? 1 : 0) - (k.has('s') ? 1 : 0)
+    const str = (k.has('d') ? 1 : 0) - (k.has('a') ? 1 : 0)
+    const rise = (k.has('e') ? 1 : 0) - (k.has('q') ? 1 : 0)
+    const sp0 = (k.has('shift') ? 24 : 8)
+    const tx = (fx * fwd + rx * str) * sp0, ty = (fy * fwd + rise) * sp0, tz = (fz * fwd + rz * str) * sp0
+    const a = 1 - Math.exp(-dt * 5) // ease in and out
+    f.vx += (tx - f.vx) * a; f.vy += (ty - f.vy) * a; f.vz += (tz - f.vz) * a
+    f.x += f.vx * dt; f.y += f.vy * dt; f.z += f.vz * dt
+    f.y = Math.min(Math.max(f.y, this.surfaceY(f.x, f.z) + 0.25), 60) // stay above the ground
+  }
+
+  private updateCamera(t: number, aspect: number, dt = 0) {
     const { _f, _r, _u, _up, pointer } = this
+    if (this.manual) {
+      this.updateFly(dt)
+      const f = this.fly, cp = Math.cos(f.pitch)
+      _f.set(Math.sin(f.yaw) * cp, Math.sin(f.pitch), -Math.cos(f.yaw) * cp)
+      _up.set(0, 1, 0)
+      _r.crossVectors(_f, _up).normalize()
+      _u.crossVectors(_r, _f).normalize()
+      this.camU.uCamPos.value.set(f.x, f.y, f.z)
+      this.camU.uCamF.value.copy(_f); this.camU.uCamR.value.copy(_r); this.camU.uCamU.value.copy(_u)
+      return
+    }
     const z = -t * SPEED
     const x = pathX(z)
     const y = 3.6 + 0.3 * Math.sin(t * 0.071) + 0.09 * Math.sin(t * 0.19 + 1.0)
@@ -643,7 +742,8 @@ export class Engine {
       return
     }
     const dt = Math.min(rawDt, 0.1)
-    this.simT += dt * (this.reduceMotion ? 0.35 : 1.0)
+    this.lastDt = dt
+    if (!this.manual) this.simT += dt * (this.reduceMotion ? 0.35 : 1.0)
     this.clock += dt
     this.frame++
     const st = useSettings.getState()
@@ -702,7 +802,7 @@ export class Engine {
     camU.uTime.value = this.clock
     this.applySun()
     camU.uFrame.value = this.frame
-    this.updateCamera(this.simT, aspect)
+    this.updateCamera(this.simT, aspect, this.lastDt)
 
     const f = camU.uCamF.value, rr = camU.uCamR.value, u = camU.uCamU.value
     const mf = MOON_DIR.dot(f)
@@ -757,6 +857,7 @@ export class Engine {
     if (this.perfN < 90) return
     const avg = (this.perfAcc / this.perfN) * 1000
     this.fps = 1000 / avg
+    if (this.TIMING) { this.timings.fps = Math.round(this.fps); this.timings.cloudScale = Math.round(this.scale * 100) / 100 }
     this.perfAcc = 0; this.perfN = 0
     const now = this.clock
     if (avg > 24 && this.scale > SCALE_MIN) {

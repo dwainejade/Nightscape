@@ -35,10 +35,14 @@ const fmtHour = (h: number) => {
   const m = Math.round(h * 60) % 1440
   return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
 }
+const moonName = (p: number) => {
+  const names = ['New', 'Crescent', 'First qtr', 'Gibbous', 'Full', 'Gibbous', 'Last qtr', 'Crescent']
+  return names[Math.round(p * 8) % 8]
+}
 const TIMES: [string, number][] = [['Midnight', 0], ['Dawn', 5.75], ['Morning', 9], ['Noon', 12], ['Sunset', 18], ['Dusk', 19.25]]
 
 function TimeTab() {
-  const { tod, setTod, playing, setPlaying, dayLen, setDayLen } = useSettings()
+  const { tod, setTod, playing, setPlaying, dayLen, setDayLen, moonPhase, setMoonPhase } = useSettings()
   return (
     <>
       <div style={{ fontSize: 22, textAlign: 'center', margin: '4px 0 8px', fontVariantNumeric: 'tabular-nums' }}>{fmtHour(tod)}</div>
@@ -53,6 +57,12 @@ function TimeTab() {
         <input type="range" min={10} max={600} step={5} value={dayLen} style={{ width: '100%', minWidth: 0, margin: 0 }}
           onChange={(e) => setDayLen(parseFloat(e.target.value))} />
         <span style={{ textAlign: 'right' }}>{dayLen}s</span>
+      </label>
+      <label style={row}>
+        <span>Moon phase</span>
+        <input type="range" min={0} max={1} step={0.01} value={moonPhase} style={{ width: '100%', minWidth: 0, margin: 0 }}
+          onChange={(e) => setMoonPhase(parseFloat(e.target.value))} />
+        <span style={{ textAlign: 'right' }}>{moonName(moonPhase)}</span>
       </label>
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 11, lineHeight: 1.4 }}>
         Seconds of real time for a full 24 hours. The sun rises in the east at 06:00 and sets at 18:00. Cloud and ground lighting in daytime is an approximation of the baked moonlight.
@@ -87,8 +97,13 @@ function ColourTab() {
 }
 
 export function Panel() {
-  const { panelOpen, setPanelOpen, tab, setTab } = useSettings()
+  const { panelOpen, setPanelOpen, tab, setTab, manual, setManual } = useSettings()
   return (
+    <>
+    <div data-ui style={{ position: 'fixed', left: 12, bottom: 12, zIndex: 5, color: '#cfe', font: '12px system-ui', display: 'flex', alignItems: 'center', gap: 8 }}>
+      <button onClick={() => setManual(!manual)} style={{ ...chip(manual), padding: '4px 10px' }}>{manual ? 'Manual flight' : 'Auto flight'}</button>
+      <span style={{ opacity: 0.6 }}>{manual ? 'drag: look · WASD: move · Q/E: down/up · Shift: fast · R: auto' : 'drag or press WASD to take control'}</span>
+    </div>
     <div data-ui style={{ position: 'fixed', top: 0, right: 0, bottom: panelOpen ? 0 : 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', color: '#cfe', font: '12px system-ui', zIndex: 5, pointerEvents: 'none' }}>
       <button onClick={() => setPanelOpen(!panelOpen)}
         style={{ ...chip(false), padding: '4px 10px', background: '#0008', margin: 12, marginBottom: panelOpen ? 0 : 12, pointerEvents: 'auto', flexShrink: 0 }}>
@@ -106,5 +121,6 @@ export function Panel() {
         </div>
       )}
     </div>
+    </>
   )
 }
