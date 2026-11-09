@@ -69,16 +69,23 @@ export const CLOUD_CONTROLS: CloudControl[] = [
   { key: "speed", label: "Change time (s)", min: 2, max: 60, step: 1, live: true },
 ]
 
+export interface Place { name: string; lat: number; lon: number }
+
 interface SettingsState {
   grade: Grade
+  place: Place | null              // null: the invented mountains
+  placeStatus: 'idle' | 'loading' | 'ready' | 'error'
+  placeInfo: string                // a line about the loaded place (not saved)
+  fade: number                     // 1 hides the scene while a new place loads (not saved)
+  setPlace: (p: Place | null) => void
   clouds: Clouds
   morph: number // 0..1 while the clouds build up or disperse, -1 when still (not saved)
   rebake: number // 0..1 while the clouds re-bake after a shape change, -1 when idle (not saved)
-  tab: "clouds" | "colour"
+  tab: "clouds" | "colour" | "place"
   panelOpen: boolean
   setClouds: (patch: Partial<Clouds>) => void
   applyCloudPreset: (name: string) => void
-  setTab: (tab: "clouds" | "colour") => void
+  setTab: (tab: "clouds" | "colour" | "place") => void
   setGrade: (patch: Partial<Grade>) => void
   applyPreset: (name: string) => void
   setPanelOpen: (open: boolean) => void
@@ -91,6 +98,11 @@ export const useSettings = create<SettingsState>()(
       clouds: { preset: "Default", ...CLOUD_DEFAULT },
       rebake: -1,
       morph: -1,
+      place: null,
+      placeStatus: "idle",
+      placeInfo: "",
+      fade: 0,
+      setPlace: (place) => set({ place }),
       tab: "clouds",
       panelOpen: false,
       setClouds: (patch) => set((s) => ({ clouds: { ...s.clouds, ...patch, preset: patch.preset ?? "Custom" } })),
@@ -102,9 +114,9 @@ export const useSettings = create<SettingsState>()(
     }),
     {
       name: 'nightscape:settings:v1',
-      partialize: (s) => ({ grade: s.grade, clouds: s.clouds, tab: s.tab }),
+      partialize: (s) => ({ grade: s.grade, clouds: s.clouds, tab: s.tab, place: s.place }),
       // fill any keys added since a saved version
-      merge: (saved, cur) => ({ ...cur, tab: (saved as any)?.tab ?? cur.tab, grade: { ...cur.grade, ...((saved as any)?.grade ?? {}) }, clouds: { ...cur.clouds, ...((saved as any)?.clouds ?? {}) } }),
+      merge: (saved, cur) => ({ ...cur, place: (saved as any)?.place ?? null, tab: (saved as any)?.tab ?? cur.tab, grade: { ...cur.grade, ...((saved as any)?.grade ?? {}) }, clouds: { ...cur.clouds, ...((saved as any)?.clouds ?? {}) } }),
     },
   ),
 )

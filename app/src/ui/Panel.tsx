@@ -1,4 +1,5 @@
 import type { CSSProperties } from 'react'
+import { PlaceTab } from './PlaceTab'
 import { CLOUD_CONTROLS, CLOUD_PRESETS, GRADE_CONTROLS, GRADE_PRESETS, useSettings } from '../store/settings'
 
 const chip = (on: boolean): CSSProperties => ({
@@ -65,10 +66,11 @@ export function Panel() {
       {panelOpen && (
         <div style={{ marginTop: 8, width: 280, maxHeight: '80vh', overflow: 'auto', padding: 12, background: '#050a0ccc', border: '1px solid #fff2', borderRadius: 8, backdropFilter: 'blur(8px)' }}>
           <div style={{ display: 'flex', gap: 4, marginBottom: 10 }}>
+            <button onClick={() => setTab('place')} style={chip(tab === 'place')}>Place</button>
             <button onClick={() => setTab('clouds')} style={chip(tab === 'clouds')}>Clouds</button>
             <button onClick={() => setTab('colour')} style={chip(tab === 'colour')}>Colour</button>
           </div>
-          {tab === 'clouds' ? <CloudsTab /> : <ColourTab />}
+          {tab === 'place' ? <PlaceTab /> : tab === 'clouds' ? <CloudsTab /> : <ColourTab />}
         </div>
       )}
     </div>

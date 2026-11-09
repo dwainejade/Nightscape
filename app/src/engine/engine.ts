@@ -9,7 +9,8 @@ import {
   CLOUD_FRAG, GROUND_FRAG, RAYS_FRAG, TAA_FRAG, COMPOSITE_FRAG,
 } from '../shaders/legacy'
 import { buildNoise } from './noise'
-import { useSettings, hexToLinear, type Clouds } from '../store/settings'
+import { useSettings, hexToLinear, type Clouds, type Place } from '../store/settings'
+import { loadElevationWindow, WINDOW_PX } from '../geo/elevation'
 
 const cloudCfg = (c: Clouds) => {
   const a = (c.windDir * Math.PI) / 180
@@ -102,6 +103,11 @@ export class Engine {
   private terHPass: any; private terTPass: any; private terLPass: any
   private terJobs: any[] = []
   private terJob = 0
+  private terrainActive = false      // re-baking the terrain after a place change
+  private realTex: THREE.DataTexture | null = null
+  private lastPlace: Place | null = null
+  private placeToken = 0
+  private placeAbort: AbortController | null = null
   terHeights: Float32Array | null = null
   private cfgLive: ReturnType<typeof cloudCfg>
   private cfgBake: ReturnType<typeof cloudCfg>
@@ -224,7 +230,7 @@ export class Engine {
     this.shapePass = makePass(BAKE_SHAPE_FRAG, Object.assign({ uNoise: { value: noiseTex }, uLayer: { value: 0 } }, this.cfgBake))
     this.lightPass = makePass(BAKE_LIGHT_FRAG, Object.assign({ uNoise: { value: noiseTex }, uMoonDir: { value: MOON_DIR }, uLayer: { value: 0 } }, this.cfgBake))
     this.bakeStarted = performance.now()
-    this.terHPass = makePass(TER_H_FRAG, Object.assign({ uNoise: { value: noiseTex } }, cfgLive))
+    this.terHPass = makePass(TER_H_FRAG, Object.assign({ uNoise: { value: noiseTex }, uReal: { value: new THREE.DataTexture(new Uint16Array(1), 1, 1, THREE.RedFormat, THREE.HalfFloatType) }, uUseReal: { value: 0 } }, cfgLive))
     this.terTPass = makePass(TER_T_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uZ: { value: 0 } }, cfgLive))
     this.terLPass = makePass(TER_L_FRAG, Object.assign({ uNoise: { value: noiseTex }, uTerH: { value: this.terH.texture }, uMoonDir: { value: MOON_DIR }, uMode: { value: 0 } }, cfgLive))
     const J = this.terJobs
@@ -246,6 +252,7 @@ export class Engine {
     this.applyGrade()
     this.unsub = useSettings.subscribe((st) => {
       this.applyGrade()
+      if (st.place !== this.lastPlace) { const p = st.place; this.lastPlace = p; void this.loadPlace(p) }
       if (st.clouds !== this.lastClouds) { const c = st.clouds, p = this.lastClouds; this.lastClouds = c; this.onCloudsChanged(c, p) }
     })
   }
@@ -271,6 +278,52 @@ export class Engine {
       if (this.morphT >= 0 || this.bakeActive) { this.pending = c; return } // finish the change in progress first
       this.startBake(c)
     }, 350)
+  }
+
+  /** Load a real place (or go back to the invented mountains) and re-bake the terrain under a fade to black. */
+  private async loadPlace(p: Place | null) {
+    const token = ++this.placeToken
+    this.placeAbort?.abort()
+    const S = useSettings
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    if (!this.baked) return // the saved place is started once the first bake is done
+    S.setState({ fade: 1, placeStatus: p ? 'loading' : 'idle', placeInfo: '' })
+    const t0 = performance.now()
+    try {
+      if (!p) {
+        await sleep(450)
+        if (token !== this.placeToken) return
+        this.terHPass.u.uUseReal.value = 0
+      } else {
+        this.placeAbort = new AbortController()
+        const d = await loadElevationWindow(p.lat, p.lon, 70, this.placeAbort.signal)
+        if (token !== this.placeToken) return
+        await sleep(Math.max(0, 450 - (performance.now() - t0))) // let the fade finish
+        if (token !== this.placeToken) return
+        this.realTex?.dispose()
+        const tex = new THREE.DataTexture(d.half, WINDOW_PX, WINDOW_PX, THREE.RedFormat, THREE.HalfFloatType)
+        tex.minFilter = tex.magFilter = THREE.LinearFilter
+        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+        tex.unpackAlignment = 2
+        tex.needsUpdate = true
+        this.realTex = tex
+        this.terHPass.u.uReal.value = tex
+        this.terHPass.u.uUseReal.value = 1
+        const lo = Math.round(d.minElev), hi = Math.round(d.maxElev)
+        S.setState({ placeInfo: `${Math.round(d.windowKm)} km across, ${lo} to ${hi} m, relief drawn ${d.exaggeration.toFixed(1)}x taller than true` })
+      }
+      this.simT = 0                       // start the flight over the middle of the place
+      this.terJob = 0
+      this.terrainActive = true
+    } catch (e: any) {
+      if (token !== this.placeToken || e?.name === 'AbortError') return
+      S.setState({ placeStatus: 'error', placeInfo: String(e?.message ?? e), fade: 0 })
+    }
+  }
+
+  private onTerrainDone() {
+    this.taaPass.u.uReset.value = 1 // the view jumped: do not blend with the old place
+    useSettings.setState((s) => ({ fade: 0, placeStatus: s.place ? 'ready' : 'idle' }))
   }
 
   private startBake(c: Clouds) {
@@ -417,7 +470,6 @@ export class Engine {
     }
     this.groundPass.u.uTerTop.value = top + 0.3
     this.placeMasts()
-    this.terHPass.mat.dispose(); this.terLPass.mat.dispose()
     r.setRenderTarget(null)
     return true
   }
@@ -498,13 +550,21 @@ export class Engine {
   step(rawDt: number) {
     if (!this.baked) {
       if (this.bakeActive) this.bakeStep()
-      else if (this.terrainStep()) { this.baked = true; this.progress = 1; this.tMark('terrainDoneAt') }
+      else if (this.terrainStep()) {
+        this.baked = true; this.progress = 1; this.tMark('terrainDoneAt')
+        const saved = useSettings.getState().place
+        if (saved) { this.lastPlace = saved; void this.loadPlace(saved) }
+      }
       return
     }
     const dt = Math.min(rawDt, 0.1)
     this.simT += dt * (this.reduceMotion ? 0.35 : 1.0)
     this.clock += dt
     this.frame++
+    // after a place change, re-bake the terrain a few jobs per frame (the scene is faded out meanwhile)
+    for (let i = 0; i < 8 && this.terrainActive; i++) {
+      if (this.terrainStep()) { this.terrainActive = false; this.onTerrainDone() }
+    }
     this.updateMorph(dt)
     this.render()
     if (this.bakeActive) this.bakeStep() // background re-bake after a cloud-shape change

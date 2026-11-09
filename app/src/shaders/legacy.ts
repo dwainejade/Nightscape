@@ -378,16 +378,30 @@ export const TER_H_FRAG = `
 precision highp float;
 precision highp sampler3D;
 uniform sampler3D uNoise;   // (the shared world code refers to it)
+uniform sampler2D uReal;    // real elevation for one place, already converted to the stored height scale
+uniform float uUseReal;     // 1: use uReal, 0: the invented mountains
 varying vec2 vUv;
 ${COMMON}
 ${WORLD}
 ${TERRAIN_COMMON}
 ${TERRAIN_GEN}
+// Real terrain. The world tile repeats, so the real window is mirrored to make it seamless:
+// the window is centred on the start of the flight (tile coordinate 0) and folds back at its
+// edges, 80 world units out. A little invented detail is added on top, because the elevation
+// data is far coarser than the cloud-top view needs.
+float realY(vec2 p){
+  vec2 w = 1.0 - abs(2.0 * fract(p + 0.25) - 1.0);
+  float y = TER_LO + textureLod(uReal, w, 0.0).r * TER_RANGE;
+  float fine = 0.5 * pnoise(p, 60.0) + 0.25 * pnoise(p + 0.3, 130.0);
+  y += fine * 1.4 * smoothstep(0.3, 3.0, y - WATER_Y);
+  return clamp(y, TER_LO + 0.5, TER_LO + TER_RANGE - 1.0);
+}
+float gY(vec2 p){ return uUseReal > 0.5 ? realY(p) : groundY(p); }
 void main(){
   vec2 p = gl_FragCoord.xy / ${TER_N}.0;
   float e = 1.0 / ${TER_N}.0;
-  float h0 = groundY(p);
-  float slope = length(vec2(groundY(p + vec2(e, 0.0)) - h0, groundY(p + vec2(0.0, e)) - h0)) / TER_TEXEL;
+  float h0 = gY(p);
+  float slope = length(vec2(gY(p + vec2(e, 0.0)) - h0, gY(p + vec2(0.0, e)) - h0)) / TER_TEXEL;
   float hw = h0 - WATER_Y;
   // Forest: off the cliffs, above the shore, below a ragged tree line, in patches.
   float patchN = pfbm(p + 0.29, 22.0);
