@@ -71,6 +71,8 @@ export const CLOUD_CONTROLS: CloudControl[] = [
 
 export interface Place { name: string; lat: number; lon: number }
 
+export type Tab = 'clouds' | 'colour' | 'place' | 'time'
+
 interface SettingsState {
   grade: Grade
   place: Place | null              // null: the invented mountains
@@ -81,11 +83,17 @@ interface SettingsState {
   clouds: Clouds
   morph: number // 0..1 while the clouds build up or disperse, -1 when still (not saved)
   rebake: number // 0..1 while the clouds re-bake after a shape change, -1 when idle (not saved)
-  tab: "clouds" | "colour" | "place"
+  tab: Tab
   panelOpen: boolean
+  tod: number                      // time of day, hours 0..24 (the engine writes it back a few times a second while playing)
+  playing: boolean                 // day/night cycle running (not saved)
+  dayLen: number                   // real seconds for one full day
+  setTod: (h: number) => void
+  setPlaying: (p: boolean) => void
+  setDayLen: (s: number) => void
   setClouds: (patch: Partial<Clouds>) => void
   applyCloudPreset: (name: string) => void
-  setTab: (tab: "clouds" | "colour" | "place") => void
+  setTab: (tab: Tab) => void
   setGrade: (patch: Partial<Grade>) => void
   applyPreset: (name: string) => void
   setPanelOpen: (open: boolean) => void
@@ -105,6 +113,12 @@ export const useSettings = create<SettingsState>()(
       setPlace: (place) => set({ place }),
       tab: "clouds",
       panelOpen: false,
+      tod: 0,
+      playing: false,
+      dayLen: 120,
+      setTod: (tod) => set({ tod: ((tod % 24) + 24) % 24 }),
+      setPlaying: (playing) => set({ playing }),
+      setDayLen: (dayLen) => set({ dayLen }),
       setClouds: (patch) => set((s) => ({ clouds: { ...s.clouds, ...patch, preset: patch.preset ?? "Custom" } })),
       applyCloudPreset: (name) => set({ clouds: { preset: name, ...CLOUD_PRESETS[name] } }),
       setTab: (tab) => set({ tab }),
@@ -114,9 +128,9 @@ export const useSettings = create<SettingsState>()(
     }),
     {
       name: 'nightscape:settings:v1',
-      partialize: (s) => ({ grade: s.grade, clouds: s.clouds, tab: s.tab, place: s.place }),
+      partialize: (s) => ({ grade: s.grade, clouds: s.clouds, tab: s.tab, place: s.place, tod: s.tod, dayLen: s.dayLen }),
       // fill any keys added since a saved version
-      merge: (saved, cur) => ({ ...cur, place: (saved as any)?.place ?? null, tab: (saved as any)?.tab ?? cur.tab, grade: { ...cur.grade, ...((saved as any)?.grade ?? {}) }, clouds: { ...cur.clouds, ...((saved as any)?.clouds ?? {}) } }),
+      merge: (saved, cur) => ({ ...cur, place: (saved as any)?.place ?? null, tab: (saved as any)?.tab ?? cur.tab, tod: (saved as any)?.tod ?? cur.tod, dayLen: (saved as any)?.dayLen ?? cur.dayLen, grade: { ...cur.grade, ...((saved as any)?.grade ?? {}) }, clouds: { ...cur.clouds, ...((saved as any)?.clouds ?? {}) } }),
     },
   ),
 )

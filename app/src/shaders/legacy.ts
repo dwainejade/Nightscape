@@ -1099,7 +1099,8 @@ uniform vec3 uConA, uConB;   // its contrail as a straight segment, oldest end t
 uniform vec4 uCon;           // the contrail's age at A and at B (seconds), its fade time, its brightness
 uniform float uGlitter;      // how much the contrail's ice crystals glint
 uniform sampler2D uMoonMap;
-uniform vec3 uBalance, uShadowTint, uHighTint;
+uniform vec3 uBalance, uShadowTint, uHighTint, uSunDir;
+uniform float uDayAmt, uNightAmt, uTwi;   // day/night cycle: how much day, how much night (stars, moon), how much twilight
 uniform float uShadowAmt, uHighAmt, uLift, uSat, uContrast, uVignette, uGrain, uRays;
 varying vec2 vUv;
 ${COMMON}
@@ -1281,6 +1282,22 @@ vec3 moonDisk(vec3 rd, vec3 m){
   return tint * alb * limb * edge * 1.3;
 }
 
+// Daytime sky: blue gradient, sun glow and disc, and a warm band toward the sun at dawn and dusk.
+vec3 daySky(vec3 rd, vec3 s){
+  float y = max(rd.y, 0.0);
+  vec3 col = mix(vec3(0.60, 0.76, 0.98), vec3(0.09, 0.26, 0.72), pow(y, 0.45));
+  float cs = dot(rd, s);
+  col += vec3(1.0, 0.82, 0.55) * (0.30 * pow(max(cs, 0.0), 6.0) + 0.9 * pow(max(cs, 0.0), 64.0));
+  vec2 hd = normalize(rd.xz + 1e-5), sd = normalize(s.xz + 1e-5);
+  float az = max(dot(hd, sd), 0.0);
+  vec3 warm = mix(vec3(0.95, 0.40, 0.14), vec3(0.30, 0.20, 0.45), smoothstep(0.0, 0.5, y));
+  col = mix(col, warm * (0.25 + 0.75 * az * az), uTwi * 0.8 * exp(-y * 3.0) * (0.35 + 0.65 * az));
+  col = mix(col, col * vec3(0.45, 0.5, 0.75), uTwi * 0.4);
+  float a = acos(clamp(cs, -1.0, 1.0));
+  col += vec3(1.0, 0.95, 0.85) * 40.0 * (1.0 - smoothstep(0.0085, 0.0105, a));   // the sun's disc
+  return col * (0.04 + 0.96 * smoothstep(-0.15, 0.25, s.y));
+}
+
 vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
 
 void main(){
@@ -1298,7 +1315,7 @@ void main(){
   float am = 2.0 * asin(clamp(length(rd - m) * 0.5, 0.0, 1.0));
   // stars reach almost to the horizon, a little dimmer low down where the air is thickest
   // (uStarLow: the height, as sin of the angle, where they have fully faded in)
-  float starVis = smoothstep(max(uStarLow - 0.035, 0.0), uStarLow, rd.y) * mix(0.7, 1.0, smoothstep(0.0, 0.2, rd.y)) * smoothstep(0.06, 0.45, am);
+  float starVis = uNightAmt * smoothstep(max(uStarLow - 0.035, 0.0), uStarLow, rd.y) * mix(0.7, 1.0, smoothstep(0.0, 0.2, rd.y)) * smoothstep(0.06, 0.45, am);
   float diskMask = 1.0 - smoothstep(uMoonR * 0.92, uMoonR * 0.99, am);
   // (stars only where they can show: above the horizon, clear of the moon and the clouds)
   vec3 st = starVis * c.a > 0.0 ? stars(rd) * starVis : vec3(0.0);
@@ -1306,9 +1323,13 @@ void main(){
   if (rd.y > 0.0 && rd.y < 0.3 && c.a > 0.0) st += heroStars(rd) * smoothstep(0.0, 0.015, rd.y) * smoothstep(0.03, 0.2, am);
   if (uMet.w > 0.0 && rd.y > 0.0 && c.a > 0.0) st += meteor(rd) * smoothstep(0.0, 0.03, rd.y);
   if (uAirOn > 0.0 && rd.y > 0.0 && c.a > 0.0) st += aircraft(rd) * smoothstep(0.0, 0.02, rd.y);
-  vec3 sky = skyBase(rd, m) * (1.0 - 0.82 * diskMask) + st + moonDisk(rd, m);
-
-  vec3 col = c.rgb + sky * c.a;
+  vec3 night = skyBase(rd, m) * (1.0 - 0.82 * diskMask) + st + moonDisk(rd, m) * uNightAmt;
+  vec3 sky = mix(night, daySky(rd, uSunDir), uDayAmt);
+  // the clouds and ground are lit by the baked moonlight; in daytime lift and warm them toward the sun
+  float sunUp = smoothstep(0.0, 0.4, uSunDir.y);
+  vec3 sunTint = mix(vec3(1.0, 0.55, 0.32), vec3(1.0, 0.97, 0.92), sunUp);
+  vec3 lit = c.rgb * sunTint * (14.0 * (0.2 + 0.8 * sunUp));
+  vec3 col = mix(c.rgb, lit, uDayAmt) + sky * c.a;
   // lightning: the bolt itself (already hidden by the clouds in front of it), and a
   // faint brightening of the open air around the flash
   if (uBoltOn > 0.0) col += texture2D(tBolt, vUv).rgb * 32.0;
@@ -1324,7 +1345,7 @@ void main(){
     col += uFarCol.rgb * uFar.w * g * (c.a + uFarCol.w * (2.5 * c.a * (1.0 - c.a) + 0.06));
   }
   float rays = texture2D(tRays, vUv).r;
-  col += rays * vec3(0.74, 0.80, 0.95) * 0.6 * uRays * (1.0 - 0.8 * diskMask * c.a);
+  col += rays * vec3(0.74, 0.80, 0.95) * 0.6 * uRays * uNightAmt * (1.0 - 0.8 * diskMask * c.a);
 
   // ---- colour grade (all of it driven from the panel) ----
   const vec3 LW = vec3(0.2126, 0.7152, 0.0722);

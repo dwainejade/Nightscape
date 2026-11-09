@@ -67,6 +67,8 @@ export class Engine {
   scale = 0.5
   auto = true
   simT = 0
+  tod = useSettings.getState().tod
+  todSync = 0
   clock = 0
   frame = 0
   baked = false
@@ -214,6 +216,7 @@ export class Engine {
       uGrain: { value: 0.007 }, uRays: { value: 1 },
       tBolt: { value: null }, uBoltOn: { value: 0 }, uSkyFlash: { value: V3() }, uFlashDir: { value: new THREE.Vector3(0, 1, 0) },
       uFar: { value: new THREE.Vector4(0, 0, -1, 0) }, uFarShape: { value: new THREE.Vector3(0.1, 0, 0.04) }, uFarCol: { value: new THREE.Vector4(1, 0.84, 0.74, 1) },
+      uSunDir: { value: new THREE.Vector3(1, -1, 0) }, uDayAmt: { value: 0 }, uNightAmt: { value: 1 }, uTwi: { value: 0 },
       uAirOn: { value: 0 }, uAirW: { value: new THREE.Vector3(0, 1, 0) }, uAirR: { value: new THREE.Vector3(0, 1, 0) }, uAirG: { value: new THREE.Vector3(0, 1, 0) },
       uAirI: { value: V3() }, uConA: { value: V3() }, uConB: { value: V3() }, uCon: { value: new THREE.Vector4(0, 0, 150, 0) }, uGlitter: { value: 1 },
     }, camU, cfgLive))
@@ -252,6 +255,7 @@ export class Engine {
     this.applyGrade()
     this.unsub = useSettings.subscribe((st) => {
       this.applyGrade()
+      if (st.tod !== this.tod) this.tod = st.tod // moved from the panel
       if (st.place !== this.lastPlace) { const p = st.place; this.lastPlace = p; void this.loadPlace(p) }
       if (st.clouds !== this.lastClouds) { const c = st.clouds, p = this.lastClouds; this.lastClouds = c; this.onCloudsChanged(c, p) }
     })
@@ -352,6 +356,21 @@ export class Engine {
     u.uShadowAmt.value = g.shadowAmt; u.uHighAmt.value = g.highAmt
     u.uLift.value = g.lift; u.uSat.value = g.sat; u.uContrast.value = g.contrast
     u.uVignette.value = g.vignette; u.uGrain.value = g.grain; u.uRays.value = g.rays
+  }
+
+  /** Sun position and day/night weights from the time of day (6 = sunrise in the east, 12 = high noon, 18 = sunset). */
+  applySun() {
+    const phi = ((this.tod - 6) / 12) * Math.PI
+    const u = this.compPass.u
+    const sy = Math.sin(phi)
+    u.uSunDir.value.set(Math.cos(phi), sy * 0.9, -0.5 * sy).normalize()
+    const y = u.uSunDir.value.y
+    const sm = (a: number, b: number, x: number) => { const t = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t) }
+    const day = sm(-0.18, 0.1, y)
+    u.uDayAmt.value = day
+    u.uNightAmt.value = 1 - sm(-0.2, -0.02, y)
+    u.uTwi.value = 1 - sm(0.0, 0.4, Math.abs(y + 0.04))
+    this.groundPass.u.uLamps.value = 1 - 0.95 * sm(-0.1, 0.12, y)
   }
 
   /** Called when the canvas size or pixel ratio changes. */
@@ -561,6 +580,12 @@ export class Engine {
     this.simT += dt * (this.reduceMotion ? 0.35 : 1.0)
     this.clock += dt
     this.frame++
+    const st = useSettings.getState()
+    if (st.playing) {
+      this.tod = (this.tod + (dt * 24) / Math.max(st.dayLen, 5)) % 24
+      this.todSync += dt
+      if (this.todSync > 0.25) { this.todSync = 0; useSettings.setState({ tod: this.tod }) }
+    }
     // after a place change, re-bake the terrain a few jobs per frame (the scene is faded out meanwhile)
     for (let i = 0; i < 8 && this.terrainActive; i++) {
       if (this.terrainStep()) { this.terrainActive = false; this.onTerrainDone() }
@@ -608,6 +633,7 @@ export class Engine {
     camU.uAspect.value = aspect
     camU.uTanHalf.value = tanHalf
     camU.uTime.value = this.clock
+    this.applySun()
     camU.uFrame.value = this.frame
     this.updateCamera(this.simT, aspect)
 
