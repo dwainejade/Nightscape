@@ -19,7 +19,7 @@ reused.
 ## Step 0: Master setup
 - [x] Clone the fork to `Projects/Nightscape`; `app/` installs and builds
 - [x] PROGRESS.md
-- [ ] User picks the first step and model
+- [x] User picks the first step and model: N1 on Sonnet (started 2026-11-09)
 
 ## Already in the app (before this plan)
 - Nightscape clouds ported to R3F (WebGL 2), settings store and panel
