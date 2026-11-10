@@ -42,6 +42,7 @@ vec3 skyBase(vec3 rd, vec3 m){
 export const WORLD = `
 // The world is one 320 x 320 tile repeated forever: every noise frequency is a
 // whole number of cycles per tile, and the tower grid has 13 cells per tile.
+const float FAR_LO = 560.0, FAR_HI = 800.0;  // how far the cloud march reaches (world units)
 const float TILE = 320.0;
 const float CELL = TILE / 13.0;
 const float SEA_TOP = 8.2;
@@ -743,7 +744,7 @@ void main(){
 
   // How far the march reaches: further for rays rising over the horizon, blended by
   // height so neighbouring rays never switch between two limits from one frame to the next.
-  float tFar = mix(200.0, 320.0, smoothstep(0.0, 0.04, rd.y));
+  float tFar = mix(FAR_LO, FAR_HI, smoothstep(0.0, 0.04, rd.y));
   float tMax = tFar;
   // (rays that leave through the base of the deck see the ocean far below)
   if (rd.y > 0.0) tMax = min(tMax, (Y_MAX - ro.y) / rd.y);
@@ -777,9 +778,14 @@ void main(){
   float dSum = 0.0, wSum = 0.0;
   // Samples sit on planes fixed in the world (constant z, spacing doubling with
   // distance), so flying forward never slides the sample slices through a cloud.
-  float rz = -rd.z;
+  // (planes are perpendicular to whichever horizontal axis the ray runs along most, mirrored so that the march always
+  // goes toward smaller coordinates: the grid is symmetric, so every heading gets the stable planar sampling)
+  bool alongX = abs(rd.x) > abs(rd.z);
+  float rcomp = alongX ? rd.x : rd.z;
+  float rz = abs(rcomp);
+  float roz = (rcomp > 0.0 ? -1.0 : 1.0) * (alongX ? ro.x : ro.z);
   bool planar = rz > 0.25;
-  float t = planar ? nextPlaneT(ro.z, rz, 0.05) : 0.05 + jit * 0.22;
+  float t = planar ? nextPlaneT(roz, rz, 0.05) : 0.05 + jit * 0.22;
   float SIG = uDensity;   // extinction; live setting
   const float MOON_I = 3.1;
   const float SUN_D = 44.0;   // the sun, as it should look on screen (the moonlit clouds were 3.1 x 14 = 43)
@@ -805,7 +811,7 @@ void main(){
       // coarser spacing happens gradually instead of all at once.
       float lam = log2(max(t * rz, 1e-3) / 5.0) + 1.0;
       float f = lam > 0.0 ? smoothstep(0.5, 1.0, fract(lam)) : 0.0;
-      bool odd = mod(floor((ro.z - t * rz) / sp + 0.5), 2.0) > 0.5;
+      bool odd = mod(floor((roz - t * rz) / sp + 0.5), 2.0) > 0.5;
       dtW = dt * (odd ? 1.0 - f : 1.0 + f);
     }
     if (sd < -0.32){
@@ -816,13 +822,13 @@ void main(){
       if (!planar) t += max(dt, sk);
       // no further than one regular step: take exactly that step (t may sit on a finer
       // grid than sp, so stepping a full dt from it could pass over the next plane)
-      else if (sk <= dt) t = nextSampleT(ro.z, rz, t, sp, spB, refine);
+      else if (sk <= dt) t = nextSampleT(roz, rz, t, sp, spB, refine);
       else {
         // land on the grid of the band (and refinement) where the skip ends; a skip of
         // at most 2 units never crosses more than one band edge
         float ts = t + sk;
         float spL = ts * rz >= spB * (5.0 / 0.06) ? 2.0 * spB : spB;
-        t = nextPlaneSp(ro.z, rz, ts - 1e-3, refine ? 0.5 * spL : spL);
+        t = nextPlaneSp(roz, rz, ts - 1e-3, refine ? 0.5 * spL : spL);
       }
       continue;
     }
@@ -871,7 +877,7 @@ void main(){
       float w = T * (1.0 - tr); dSum += w * t; wSum += w;
       T *= tr;
     }
-    t = planar ? nextSampleT(ro.z, rz, t, sp, spB, refine) : t + dt * (0.85 + 0.3 * fract(jit + float(i) * 0.754878));
+    t = planar ? nextSampleT(roz, rz, t, sp, spB, refine) : t + dt * (0.85 + 0.3 * fract(jit + float(i) * 0.754878));
   }
   // Through a break in the deck the ray goes on down to the flooded mountains, which
   // the ground pass draws next (keeping that work out of this heavy shader): it gets

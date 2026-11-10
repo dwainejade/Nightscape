@@ -107,6 +107,13 @@ fast flights NYC west at 40 u/s and Seattle south at 90 u/s: p99 frame 9.5 ms, 2
   daylight changes with longitude while flying east/west (setting "Sun follows longitude"); the HUD store is `store/hud.ts`; `ap.dest`,
   `useSettings.dest`, `tour` drive the route. Cruise y is 6.5 (just above the deck), dips go to ground + 13.
 
+**N2 follow-up: cloud rendering at any heading** The cloud march's stable, world-fixed sample planes only existed for rays heading toward -z
+(the old fixed path); every other heading (east, south, behind) fell back to a jittered march, which showed as stripe artifacts. Now the planes
+are perpendicular to whichever horizontal axis the ray runs along most (mirrored, so the grid stays aligned), so all headings get the planar
+sampling. March reach raised from 200-320 to 560-800 units (`FAR_LO`/`FAR_HI` in `legacy.ts`): far cumulus towers now reach the horizon; ~90-120 fps in
+the preview at 0.55 render scale. Checked north, east, behind, from above (y 30, looking down) and from beneath (y -30). Not changed: the packed
+depth for TAA still caps at 250 units (farther cloud reprojects as at infinity), the 320-unit cloud tile still repeats (N1's variety noise hides it).
+
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here
 - [ ] Real lights from NASA Black Marble (GIBS WMTS, public domain, keyless) in the terrain window,
