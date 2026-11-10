@@ -114,6 +114,12 @@ sampling. March reach raised from 200-320 to 560-800 units (`FAR_LO`/`FAR_HI` in
 the preview at 0.55 render scale. Checked north, east, behind, from above (y 30, looking down) and from beneath (y -30). Not changed: the packed
 depth for TAA still caps at 250 units (farther cloud reprojects as at infinity), the 320-unit cloud tile still repeats (N1's variety noise hides it).
 
+**N2 follow-up: cloud shape variety** (`legacy.ts`: `cumulusLayer`, `cumulonimbus`). Cumulus is two grids now (small heaps, and fewer big towering
+ones, 5 cells per 320 tile) with a slow cluster field that groups heaps into banks with gaps; each heap has its own 5-8 bubbles, elongation and
+heading, height (flat to tall) and bubble sizes. Storm towers: 16 per tile instead of 9, each with its own height, girth profile (taper/bulge),
+wind shear direction and strength, anvil size, and often a second smaller updraft. Bake time unchanged within noise (~4.4 s here, pane throttled).
+Tuning knobs: the `cumulusLayer` calls in `towers()` (size, density, height) and `uStorm * 0.6` gating in `cumulonimbus`.
+
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here
 - [ ] Real lights from NASA Black Marble (GIBS WMTS, public domain, keyless) in the terrain window,

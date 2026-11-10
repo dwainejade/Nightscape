@@ -52,7 +52,7 @@ const float CLOUD_BASE = -1.75;
 const float OCEAN_Y = -85.0;
 const float F_A = 3.0 / TILE, F_B = 11.0 / TILE, F_COV = 2.0 / TILE;
 const float F_DECK = 2.0 / TILE, F_DECK2 = 6.0 / TILE, F_BIL = 26.0 / TILE, F_DET = 42.0 / TILE, F_LOB = 9.0 / TILE;
-const float CB_CELL = TILE / 3.0;
+const float CB_CELL = TILE / 4.0;
 // user-controlled cloud shape (see engine cloud settings; defaults reproduce the original look)
 uniform float uCover, uCumulus, uStorm, uDeckH;
 uniform vec2 uWindV;   // upper-level wind that drags the anvils out (default 0.8, -0.6)
@@ -106,35 +106,46 @@ float lobes(vec3 p){
        + 0.38 * texture(uNoise, p * (2.0 * F_LOB) + vec3(0.17, 0.71, 0.41)).r;
 }
 
+vec2 rot2(vec2 v, float a){ float sn = sin(a), cs = cos(a); return vec2(cs * v.x - sn * v.y, sn * v.x + cs * v.y); }
+
 // Cumulus heaps, built the way real cumulus grows: a cluster of rounded thermal
 // bubbles, big and spread out at the base, smaller and higher toward the top, each
-// pushed a little downwind. Some stay low and wide, others stack into turrets.
-float towers(vec3 p, float bil, float lob){
-  vec2 g = p.xz / CELL - 0.5;
+// pushed a little downwind. Two layers of grid cells (small heaps, and fewer big towering ones) so sizes
+// really differ; a slow "cluster" field groups heaps into banks with clear gaps between; and every heap
+// has its own bubble count, elongation, heading, height and bubble sizes. (A cloud must stay within 0.7
+// of a cell, which is what the 2x2 neighbour lookup covers: hence the two grids.)
+float cumulusLayer(vec3 p, float bil, float lob, float cell, float nc, float rMin, float rVar, float dens, float seed, float hMul){
+  vec2 g = p.xz / cell - 0.5;
   vec2 i0 = floor(g);
   float best = -8.0;
   for (int j = 0; j < 2; j++){
     for (int i = 0; i < 2; i++){
       vec2 id = i0 + vec2(float(i), float(j));
-      vec2 idw = mod(id, 13.0);
-      vec4 h = hash42(idw + 31.7);
-      if (h.x < 1.0 - uCumulus) continue;
-      vec2 c = (id + 0.2 + 0.6 * h.yz) * CELL;
-      float h5 = hash12(idw * 1.37 + 7.1);
-      float Rb = 2.8 + 3.0 * h.w;
-      float H = Rb * (0.5 + 1.3 * h5);
+      vec2 idw = mod(id, nc);
+      vec4 h = hash42(idw + seed + 31.7);
+      vec2 c = (id + 0.2 + 0.6 * h.yz) * cell;
+      float cf = smoothstep(0.30, 0.70, texture(uNoise, vec3(c * (3.0 / TILE) + seed * 0.013, 0.45)).b);
+      if (h.x < 1.0 - clamp(uCumulus * dens * (0.15 + 1.7 * cf), 0.0, 1.0)) continue;
+      float h5 = hash12(idw * 1.37 + 7.1 + seed);
+      float Rb = (rMin + rVar * h.w) * (0.85 + 0.15 * cf);
+      float H = Rb * hMul * (0.4 + 1.7 * h5 * h5);                       // from low and flat to tall
       if (pdist(c.x - pathX(c.y)) < Rb * 2.0 + 3.0) continue;
       vec2 dc = p.xz - c;
-      float reach = Rb * 2.3 + 3.0;
+      float reach = Rb * 2.9 + 2.0;
       if (dot(dc, dc) > reach * reach || p.y > H + Rb + 2.0) continue;
+      float nb = 5.0 + floor(3.99 * fract(h5 * 9.1));                    // 5 to 8 bubbles
+      float a0 = fract(h5 * 17.3) * 6.2832, el = 1.0 + 0.7 * fract(h5 * 5.7);   // heap elongated along a0
       float cl = -1e3;
-      for (int k = 0; k < 6; k++){
-        vec4 hk = hash42(idw * 3.7 + float(k) * 11.3 + 5.1);
-        float tk = float(k) / 5.0;
-        float rk = Rb * mix(1.0, 0.5, tk) * (0.75 + 0.5 * hk.x);
+      for (int k = 0; k < 8; k++){
+        if (float(k) >= nb) break;
+        vec4 hk = hash42(idw * 3.7 + float(k) * 11.3 + 5.1 + seed);
+        float tk = float(k) / (nb - 1.0);
+        float rk = Rb * mix(1.0, 0.45, tk) * (0.6 + 0.8 * hk.x);
         float ang = hk.y * 6.2832;
-        float off = Rb * 0.75 * (1.0 - 0.6 * tk) * sqrt(hk.z);
-        vec2 cxz = c + vec2(cos(ang), sin(ang)) * off + WIND * tk * Rb * 0.4;
+        float off = Rb * 0.7 * (1.0 - 0.6 * tk) * sqrt(hk.z);
+        vec2 o = vec2(cos(ang), sin(ang)) * off;
+        o = rot2(vec2(o.x * el, o.y / el), a0);
+        vec2 cxz = c + o + WIND * tk * Rb * 0.4;
         vec3 d = p - vec3(cxz.x, -0.5 + tk * H + rk * 0.2, cxz.y);
         d.y *= 1.15;
         cl = smax(cl, rk - length(d), rk * 0.45);
@@ -146,9 +157,16 @@ float towers(vec3 p, float bil, float lob){
   }
   return best;
 }
+float towers(vec3 p, float bil, float lob){
+  float small = cumulusLayer(p, bil, lob, CELL, 13.0, 2.6, 2.6, 1.0, 0.0, 1.0);
+  float big = cumulusLayer(p, bil, lob, TILE / 5.0, 5.0, 7.0, 7.0, 0.5, 57.3, 0.85);   // fewer, much bigger
+  return max(small, big);
+}
 
 // Cumulonimbus: a broad, lumpy updraft column climbing to 35-55 units, flattening
 // into a wind-dragged anvil, with an overshooting dome punching through the top.
+// Each one differs: height, girth, how it bulges or tapers, how far and which way the
+// wind shears it, and many have a smaller second updraft growing beside the main one.
 float cumulonimbus(vec3 p, float bil, float lob){
   vec2 g = p.xz / CB_CELL - 0.5;
   vec2 i0 = floor(g);
@@ -156,26 +174,37 @@ float cumulonimbus(vec3 p, float bil, float lob){
   for (int j = 0; j < 2; j++){
     for (int i = 0; i < 2; i++){
       vec2 id = i0 + vec2(float(i), float(j));
-      vec2 idw = mod(id, 3.0);
+      vec2 idw = mod(id, 4.0);
       vec4 h = hash42(idw * 7.31 + 113.7);
-      if (h.x < 1.0 - uStorm) continue;
+      if (h.x < 1.0 - uStorm * 0.6) continue;
       vec2 c = (id + 0.3 + 0.4 * h.yz) * CB_CELL;
-      float R0 = 9.0 + 6.0 * h.w;
+      float R0 = 8.0 + 8.0 * h.w;
       if (pdist(c.x - pathX(c.y)) < R0 * 2.2 + 9.0) continue;
       float h2 = hash12(idw * 3.17 + 41.3);
-      float H = 16.0 + 30.0 * h2 * h2;                 // mostly mid-sized, a few giants
+      float h3 = fract(h2 * 7.13), h4 = fract(h2 * 13.7), h6 = fract(h2 * 29.1), h7 = fract(h2 * 43.9);
+      float H = 14.0 + 34.0 * h2 * h2;                  // mostly mid-sized, a few giants
       float anvil = smoothstep(24.0, 34.0, H);          // only the tall ones spread an anvil
-      float A = 4.0 + 4.0 * fract(h2 * 7.13);
-      float Ra = R0 * (1.6 + 0.8 * fract(h2 * 13.7));
+      float A = 3.0 + 5.0 * h3;
+      float Ra = R0 * (1.5 + 1.0 * h4);
+      vec2 W = rot2(WIND, (h6 - 0.5) * 1.5) * (0.5 + 1.0 * h7);   // each sheared its own way
       float tt = clamp((p.y - CLOUD_BASE) / (H - CLOUD_BASE), 0.0, 1.0);
-      vec2 col = c + WIND * tt * tt * R0 * 0.7;
-      float colR = R0 * (0.9 + 0.3 * tt + 0.15 * exp(-tt * 7.0));
+      vec2 col = c + W * tt * tt * R0 * 0.7;
+      float bulge = (h6 - 0.35) * 0.9;                  // some taper, some swell in the middle
+      float colR = R0 * (0.85 + bulge * sin(tt * 3.1416) * 0.5 + 0.25 * tt + 0.15 * exp(-tt * 7.0));
       float an = smoothstep(H - A - 4.0, H - A + 1.0, p.y) * anvil;
-      vec2 ctr = mix(col, c + WIND * (Ra - R0) * 0.6, an);
-      float rad = mix(colR, Ra * (0.8 + 0.4 * lob), an);
+      vec2 ctr = mix(col, c + W * (Ra - R0) * 0.6, an);
+      float rad = mix(colR, Ra * (0.7 + 0.6 * lob), an);
       float sd = min(rad - length(p.xz - ctr), H - p.y);
       vec3 ov = vec3(p.x - col.x, (p.y - (H + 0.5)) * 1.6, p.z - col.y);
-      sd = max(sd, R0 * 0.85 - length(ov));
+      sd = max(sd, R0 * (0.6 + 0.4 * h3) - length(ov));
+      if (h7 > 0.35){
+        // a second, lower updraft beside it
+        float H2 = H * (0.45 + 0.35 * h4), R2 = R0 * (0.55 + 0.3 * h3);
+        float t2 = clamp((p.y - CLOUD_BASE) / (H2 - CLOUD_BASE), 0.0, 1.0);
+        vec2 c2 = c + rot2(vec2(R0 * 1.15, 0.0), h2 * 6.2832) + W * t2 * t2 * R2 * 0.7;
+        float s2 = min(R2 * (0.9 + 0.3 * t2) - length(p.xz - c2), H2 - p.y);
+        sd = smax(sd, s2, 3.0);
+      }
       sd = min(sd, p.y - (CLOUD_BASE - 1.0));
       float lump = mix(R0 * 0.55, 1.2, an);
       sd += (lob - 0.5) * 2.0 * lump + (bil - 0.5) * (4.0 - 2.6 * an);
