@@ -1,7 +1,8 @@
-import { useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { searchPlaces, type PlaceHit } from '../geo/geocode'
 import { useSettings } from '../store/settings'
+import { loadCities, type City } from '../geo/cities'
 import { MapPicker } from './MapPicker'
 
 const chip = (on = false): CSSProperties => ({
@@ -21,7 +22,18 @@ const PRESETS: PlaceHit[] = [
 ]
 
 export function PlaceTab() {
-  const { place, setPlace, placeStatus, placeInfo } = useSettings()
+  const { place, setPlace, placeStatus, placeInfo, apSpeed, setApSpeed, hudOn, setHudOn, tour, setTour, dest, setDest, manual, setManual } = useSettings()
+  const [cities, setCities] = useState<City[]>([])
+  const [cq, setCq] = useState('')
+  useEffect(() => { loadCities().then((c) => setCities([...c].sort((a, b) => b.population - a.population))).catch(() => {}) }, [])
+  const shown = useMemo(() => {
+    const t = cq.trim().toLowerCase()
+    return (t ? cities.filter((c) => `${c.name} ${c.state}`.toLowerCase().includes(t)) : cities).slice(0, 40)
+  }, [cities, cq])
+  const flyTo = (c: City) => {
+    if (!place) { setPlace({ name: `${c.name}, ${c.state}`, lat: c.lat, lon: c.lon }); return } // no real ground yet: start there
+    setTour(false); setDest(c); if (manual) setManual(false)
+  }
   const [q, setQ] = useState('')
   const [hits, setHits] = useState<PlaceHit[]>([])
   const [msg, setMsg] = useState('')
@@ -63,6 +75,32 @@ export function PlaceTab() {
         {PRESETS.map((p) => <button key={p.name} onClick={() => go(p)} style={chip(place?.name === p.name)}>{p.name}</button>)}
       </div>
 
+      <div style={{ marginTop: 10, opacity: 0.6, textTransform: 'uppercase', fontSize: 10 }}>Autopilot</div>
+      <label style={{ display: 'grid', gridTemplateColumns: '98px minmax(0, 1fr) 44px', alignItems: 'center', gap: 6, marginTop: 4 }}>
+        <span>Speed</span>
+        <input type="range" min={1} max={10} step={0.5} value={apSpeed} style={{ width: '100%', minWidth: 0, margin: 0 }} onChange={(e) => setApSpeed(parseFloat(e.target.value))} />
+        <span style={{ textAlign: 'right' }}>{apSpeed}x</span>
+      </label>
+      <div style={{ display: 'flex', gap: 4, margin: '6px 0', flexWrap: 'wrap' }}>
+        <button onClick={() => setTour(!tour)} style={chip(tour)} disabled={!place}>Tour</button>
+        <button onClick={() => setHudOn(!hudOn)} style={chip(hudOn)}>HUD</button>
+        {manual && place && <button onClick={() => setManual(false)} style={chip(false)}>Resume autopilot</button>}
+      </div>
+      <div style={{ fontSize: 11, opacity: 0.75, lineHeight: 1.4 }}>
+        {!place ? 'Pick a real place (or a city below) and the autopilot flies city to city.' : tour ? 'Touring: nearest city next, a lap around each.' : dest ? `Heading for ${dest.name}, ${dest.state}.` : 'Cruising between cities.'}
+      </div>
+      <div style={{ marginTop: 6, opacity: 0.6, textTransform: 'uppercase', fontSize: 10 }}>Fly to a city</div>
+      <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder="Filter cities..." onKeyDown={(e) => e.stopPropagation()}
+        style={{ width: '100%', boxSizing: 'border-box', marginTop: 4, background: '#0008', color: 'inherit', border: '1px solid #fff3', borderRadius: 4, padding: '4px 6px' }} />
+      <div style={{ maxHeight: 150, overflowY: 'auto', marginTop: 4 }}>
+        {shown.map((c) => (
+          <button key={`${c.name},${c.state}`} onClick={() => flyTo(c)} style={{ ...chip(dest?.name === c.name && dest?.state === c.state), display: 'block', width: '100%', textAlign: 'left', marginBottom: 2 }}>
+            {c.name}, {c.state} <span style={{ opacity: 0.5 }}>{(c.population / 1e6).toFixed(c.population >= 1e6 ? 1 : 2)}M</span>
+          </button>
+        ))}
+        {!shown.length && <div style={{ opacity: 0.6, fontSize: 11 }}>{cities.length ? 'No match.' : 'Loading cities...'}</div>}
+      </div>
+
       <div style={{ marginTop: 10, fontSize: 11, opacity: 0.85, lineHeight: 1.4 }}>
         {placeStatus === 'loading' && 'Fetching elevation...'}
         {placeStatus === 'error' && `Could not load: ${placeInfo}`}
@@ -70,7 +108,7 @@ export function PlaceTab() {
         {placeStatus === 'idle' && !place && 'Showing invented mountains. Search or pick a place to fly over real terrain.'}
       </div>
       <div style={{ marginTop: 8, fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
-        Elevation: Terrarium (AWS Open Data). Colour: Sentinel-2 cloudless by EOX, contains modified Copernicus Sentinel data 2016 (CC BY 4.0). Search: OpenStreetMap Nominatim. Lakes and rivers are read from the satellite colour; town lights and small-scale detail are generated.
+        Elevation: Terrarium (AWS Open Data). Colour: Sentinel-2 cloudless by EOX, contains modified Copernicus Sentinel data 2016 (CC BY 4.0). Search: OpenStreetMap Nominatim. Cities: US Census Bureau data (public domain). Lakes and rivers are read from the satellite colour; town lights and small-scale detail are generated.
       </div>
 
       {map && createPortal(<MapPicker initial={place} onClose={() => setMap(false)}

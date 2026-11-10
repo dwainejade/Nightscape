@@ -38,7 +38,7 @@ Make flights of thousands of km work over real places.
       north-south flights
 - [x] Rolling windows load ahead in the direction of travel, with no hitches at speed
 - [x] Cloud field doesn't visibly repeat on long flights (the 320-unit tile)
-- [ ] Coast-to-coast test: no seams, jumps or precision jitter (fast partial flights pass; full ~3,900 km run not done yet); build passes ✓
+- [x] Coast-to-coast test: no seams, jumps or precision jitter (full NYC to LA run done in N2, see N2 result); build passes ✓
 
 **N1 plan** (child session `n1-long-flight`):
 1. *Re-anchor.* Shift the world by whole multiples of 1920 units when the camera is >1400 from 0. 1920 is a
@@ -62,13 +62,50 @@ fast flights NYC west at 40 u/s and Seattle south at 90 u/s: p99 frame 9.5 ms, 2
 `groundMPerUnit()` compensate. Dev helpers: `__cloudScene.{teleport,flyTo,flyRoute,setSpeed,info,perfStart,perfStop,setCloudVariety}`.
 
 ### N2: Autopilot between cities
-- [ ] Plan written here
-- [ ] City list (reuse `volumetric-clouds/public/usa/cities.json`, or a keyless world list)
-- [ ] Route: pick a destination, fly a smooth great-circle heading over real terrain, gentle banking and
+- [x] Plan written here (below)
+- [x] City list (`app/public/cities.json`, US Census, public domain; format = array of `{name, state, lon, lat, population}`, a world list can use the same keys with `state` = region/country)
+- [x] Route: pick a destination, fly a smooth great-circle heading over real terrain, gentle banking and
       altitude changes, then the next city
-- [ ] Manual takeover with WASD/drag; R hands control back (keep the current behaviour)
-- [ ] Speed and time multiplier; HUD: nearest place, lat/lon, local time, destination
-- [ ] Build passes; a long autopilot run with no errors or ground clipping
+- [x] Manual takeover with WASD/drag; R hands control back (keep the current behaviour)
+- [x] Speed and time multiplier; HUD: nearest place, lat/lon, local time, destination
+- [x] Build passes; a long autopilot run with no errors or ground clipping
+- [x] Closes N1's coast-to-coast checkbox (NYC to LA run, results below)
+
+**N2 plan** (child session `n2-autopilot`):
+1. *Data.* `cities.json` fetched once at start (`geo/cities.ts`: load, great-circle distance/bearing, nearest, pick next). Credit in Place tab + README.
+2. *Autopilot* (`engine.ts`, only when a real place is loaded; the sine path stays for the invented scene). It drives the
+   existing free-fly camera state (`fly`) so manual takeover/handback share one pose and nothing can snap. Each frame:
+   lat/lon of the camera -> initial great-circle bearing to the destination (Mercator is conformal, so the bearing is the
+   map angle) -> yaw rate limited and smoothed -> bank follows yaw rate (<= ~0.2 rad, roll applied to the camera up vector)
+   -> advance at a constant *ground* speed (`BASE_MS` x multiplier / `groundMPerUnit()`), so speed stays right as Mercator
+   stretches. Positions stay in world units that N1's re-anchor already shifts; nothing absolute is cached.
+3. *Altitude.* Cruise just above the deck (y ~ 6.5, slow drift). Now and then (and when terrain ahead is rough) dip to
+   (highest ground ahead + clearance); climb/descent rate limited; a look-ahead floor sampled with `surfaceY` over the next
+   ~2 s plus a hard floor under the camera, so it never clips. Pitch follows the climb angle.
+4. *Arrival.* Within a few km of the city: next destination (nearest-ish unvisited big city 150-800 km away, weighted by
+   population; farther if none), optionally one orbit lap (constant-rate turn) first while touring.
+5. *Takeover.* Drag/WASD -> manual (autopilot paused, destination kept). R / button -> autopilot resumes from the current
+   position and heading (heading converges by the yaw-rate limit, so no snap).
+6. *Controls/HUD.* Store: `apSpeed` (1x-10x), `todMult` (day/night clock multiplier, in the Time tab), `hud`, `dest`, `tour`.
+   Place tab: city list with filter, "Fly to", "Tour", Stop. HUD: nearest city + state, lat/lon, altitude (m above ground),
+   local solar time (scene `tod` at the start place + lon offset / 15 h; the sun follows it), destination + distance.
+7. *Test.* NYC -> LA at high speed via dev helpers; log frame times, clearance, window swaps, re-anchors.
+
+**N2 result** (branch `claude/n2-autopilot-cdf2c2`): autopilot, HUD, Place-tab controls done; `npm run build` passes.
+- *NYC to LA (3,940 km) at 10x (18 km/s, 98 units/s):* flew to Los Angeles, arrived, picked Stockton. 12 re-anchors, ~160 window swaps
+  (load time fell to 0.17 s once tiles were cached), no errors. Lowest height over the ground 13.5 units (dips; the floor is 3.2),
+  max bank 0.22 rad, max yaw rate 0.38 rad/s. No position jumps at re-anchors or window swaps (per-step displacement == speed x dt).
+  The preview pane was hidden for part of the run (1 fps rAF), so the second half was stepped with `engine.advance(0.05)` in bursts;
+  frame-time figures from that part mean nothing. Frame time at 10x while the pane was visible: 120 fps.
+- *Takeover/handback:* key/drag takeover keeps the autopilot's velocity and eases out; R resumes from the same position/heading
+  (heading and speed ease back in). Max per-frame turn at handback 0.0002 rad, max per-frame speed change 0.3 u/s.
+- *HUD spot check:* 40.60 N 74.13 W reads "Over Elizabeth, NJ"; 38.33 N 104.23 W reads "34 km E of Pueblo, CO" (Pueblo is 38.27 N 104.61 W).
+- *Dips:* over the Rockies at 4x it dropped from y 7 to -40 (13 above ground) and climbed back; clearance never under 12.5.
+- Open: the ~40 ms window-bake frame was not re-measured (pane hidden, so timings unreliable); not fixed. Zoom doesn't change on huge
+  latitude swings (N1 note). Orbit laps pass tangentially around the city at radius = speed / turn rate (15 km at 1x, ~40 km at 6x).
+- For N3: world lights should key off `camLatLon()`/the GeoRef; the sun/`tod` is now local solar time (`localHour(lon)` in `applySun`), so
+  daylight changes with longitude while flying east/west (setting "Sun follows longitude"); the HUD store is `store/hud.ts`; `ap.dest`,
+  `useSettings.dest`, `tour` drive the route. Cruise y is 6.5 (just above the deck), dips go to ground + 13.
 
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here

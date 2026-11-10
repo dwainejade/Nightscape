@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { EngineHost } from './passes/EngineHost'
 import { Panel } from './ui/Panel'
+import { Hud } from './ui/Hud'
 import { useSettings } from './store/settings'
 
 export function App() {
@@ -33,6 +34,7 @@ export function App() {
         </div>
       )}
       <div style={{ position: 'fixed', inset: 0, background: '#000', opacity: fade, transition: 'opacity 0.45s ease', pointerEvents: 'none', zIndex: 4 }} />
+      <Hud />
       <Panel />
     </>
   )

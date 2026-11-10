@@ -42,7 +42,7 @@ const moonName = (p: number) => {
 const TIMES: [string, number][] = [['Midnight', 0], ['Dawn', 5.75], ['Morning', 9], ['Noon', 12], ['Sunset', 18], ['Dusk', 19.25]]
 
 function TimeTab() {
-  const { tod, setTod, playing, setPlaying, dayLen, setDayLen, moonPhase, setMoonPhase } = useSettings()
+  const { tod, setTod, playing, setPlaying, dayLen, setDayLen, moonPhase, setMoonPhase, todMult, setTodMult, solarSync, setSolarSync } = useSettings()
   return (
     <>
       <div style={{ fontSize: 22, textAlign: 'center', margin: '4px 0 8px', fontVariantNumeric: 'tabular-nums' }}>{fmtHour(tod)}</div>
@@ -59,13 +59,22 @@ function TimeTab() {
         <span style={{ textAlign: 'right' }}>{dayLen}s</span>
       </label>
       <label style={row}>
+        <span>Time speed</span>
+        <input type="range" min={1} max={20} step={1} value={todMult} style={{ width: '100%', minWidth: 0, margin: 0 }}
+          onChange={(e) => setTodMult(parseFloat(e.target.value))} />
+        <span style={{ textAlign: 'right' }}>{todMult}x</span>
+      </label>
+      <div style={{ margin: '8px 0' }}>
+        <button onClick={() => setSolarSync(!solarSync)} style={chip(solarSync)}>Sun follows longitude</button>
+      </div>
+      <label style={row}>
         <span>Moon phase</span>
         <input type="range" min={0} max={1} step={0.01} value={moonPhase} style={{ width: '100%', minWidth: 0, margin: 0 }}
           onChange={(e) => setMoonPhase(parseFloat(e.target.value))} />
         <span style={{ textAlign: 'right' }}>{moonName(moonPhase)}</span>
       </label>
       <div style={{ marginTop: 10, opacity: 0.7, fontSize: 11, lineHeight: 1.4 }}>
-        Seconds of real time for a full 24 hours. The sun rises in the east at 06:00 and sets at 18:00. Cloud and ground lighting in daytime is an approximation of the baked moonlight.
+        Seconds of real time for a full 24 hours (divided by Time speed). The clock is the local solar time where you started; with Sun follows longitude on, flying east or west moves the sun. The sun rises in the east at 06:00 and sets at 18:00. Cloud and ground lighting in daytime is an approximation of the baked moonlight.
       </div>
     </>
   )
@@ -102,7 +111,7 @@ export function Panel() {
     <>
     <div data-ui style={{ position: 'fixed', left: 12, bottom: 12, zIndex: 5, color: '#cfe', font: '12px system-ui', display: 'flex', alignItems: 'center', gap: 8 }}>
       <button onClick={() => setManual(!manual)} style={{ ...chip(manual), padding: '4px 10px' }}>{manual ? 'Manual flight' : 'Auto flight'}</button>
-      <span style={{ opacity: 0.6 }}>{manual ? 'drag: look · WASD: move · Q/E: down/up · Shift: fast · R: auto' : 'drag or press WASD to take control'}</span>
+      <span style={{ opacity: 0.6 }}>{manual ? 'drag: look · WASD: move · Q/E: down/up · Shift: fast · R: auto' : 'autopilot · drag or press WASD to take control'}</span>
     </div>
     <div data-ui style={{ position: 'fixed', top: 0, right: 0, bottom: panelOpen ? 0 : 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', color: '#cfe', font: '12px system-ui', zIndex: 5, pointerEvents: 'none' }}>
       <button onClick={() => setPanelOpen(!panelOpen)}

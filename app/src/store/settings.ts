@@ -236,6 +236,8 @@ export interface Place {
   lon: number;
 }
 
+export interface Dest { name: string; state: string; lat: number; lon: number; population: number }
+
 export type Tab = "clouds" | "colour" | "place" | "time";
 
 interface SettingsState {
@@ -247,6 +249,18 @@ interface SettingsState {
   setPlace: (p: Place | null) => void;
   manual: boolean; // free-fly camera (drag to look, WASD/QE to move) instead of the automatic path (not saved)
   setManual: (m: boolean) => void;
+  apSpeed: number; // autopilot speed multiplier, 1..10
+  setApSpeed: (m: number) => void;
+  todMult: number; // day/night clock multiplier (the cycle runs this many times faster than Day length says)
+  setTodMult: (m: number) => void;
+  hudOn: boolean; // flight HUD overlay
+  setHudOn: (on: boolean) => void;
+  solarSync: boolean; // the sun follows longitude (local solar time) when flying far
+  setSolarSync: (on: boolean) => void;
+  dest: Dest | null; // autopilot destination chosen by the user (the engine writes its own picks back here)
+  setDest: (d: Dest | null) => void;
+  tour: boolean; // autopilot chains nearby cities and circles each one (not saved)
+  setTour: (on: boolean) => void;
   clouds: Clouds;
   morph: number; // 0..1 while the clouds build up or disperse, -1 when still (not saved)
   rebake: number; // 0..1 while the clouds re-bake after a shape change, -1 when idle (not saved)
@@ -282,6 +296,18 @@ export const useSettings = create<SettingsState>()(
       setPlace: (place) => set({ place }),
       manual: false,
       setManual: (manual) => set({ manual }),
+      apSpeed: 1,
+      setApSpeed: (apSpeed) => set({ apSpeed: Math.max(1, Math.min(10, apSpeed)) }),
+      todMult: 1,
+      setTodMult: (todMult) => set({ todMult: Math.max(1, Math.min(30, todMult)) }),
+      hudOn: true,
+      setHudOn: (hudOn) => set({ hudOn }),
+      solarSync: true,
+      setSolarSync: (solarSync) => set({ solarSync }),
+      dest: null,
+      setDest: (dest) => set({ dest }),
+      tour: false,
+      setTour: (tour) => set({ tour }),
       tab: "clouds",
       panelOpen: false,
       tod: 0,
@@ -314,6 +340,10 @@ export const useSettings = create<SettingsState>()(
         tod: s.tod,
         dayLen: s.dayLen,
         moonPhase: s.moonPhase,
+        apSpeed: s.apSpeed,
+        todMult: s.todMult,
+        hudOn: s.hudOn,
+        solarSync: s.solarSync,
       }),
       // fill any keys added since a saved version
       merge: (saved, cur) => ({
@@ -323,6 +353,10 @@ export const useSettings = create<SettingsState>()(
         tod: (saved as any)?.tod ?? cur.tod,
         dayLen: (saved as any)?.dayLen ?? cur.dayLen,
         moonPhase: (saved as any)?.moonPhase ?? cur.moonPhase,
+        apSpeed: (saved as any)?.apSpeed ?? cur.apSpeed,
+        todMult: (saved as any)?.todMult ?? cur.todMult,
+        hudOn: (saved as any)?.hudOn ?? cur.hudOn,
+        solarSync: (saved as any)?.solarSync ?? cur.solarSync,
         grade: { ...cur.grade, ...((saved as any)?.grade ?? {}) },
         clouds: { ...cur.clouds, ...((saved as any)?.clouds ?? {}) },
       }),

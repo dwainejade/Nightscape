@@ -10,6 +10,8 @@ import {
 } from '../shaders/legacy'
 import { buildNoise } from './noise'
 import { useSettings, hexToLinear, type Clouds, type Place } from '../store/settings'
+import { useHud } from '../store/hud'
+import { loadCities, getCities, nearestCity, distanceM, bearing, pickNext, cityKey, type City } from '../geo/cities'
 import { makeGeoRef, loadTerrainWindow, prefetchWindow, metresPerUnit, latOfPy, lonOfPx, pxOfLat, pxOfLon, WIN, REAL_TILE, UNITS_PER_PX, type GeoRef, type TerrainWindow } from '../geo/terrainWindow'
 
 const cloudCfg = (c: Clouds) => {
@@ -44,6 +46,16 @@ const BIG_AMP: [number, number] = [8, 5.5]
 // camera may stray EDGE units from the centre before the edge can show. The next window is requested early
 // enough (from velocity and the measured load time) and is centred ahead of travel by at most AHEAD_MAX.
 const EDGE = 120, AHEAD_MAX = 130
+
+// Autopilot over a real place. Ground speed is constant in metres/s (so it is right at any latitude) x the speed multiplier.
+const AP_BASE_MS = 1800            // 1x: 1.8 km/s of ground (about 8 world units/s at 234 m/unit)
+const AP_CRUISE_Y = 6.5            // just above the cloud deck
+const AP_DIP_CLEAR = 13            // height above the highest ground ahead while dipping low
+const AP_FLOOR = 3.2               // never closer than this to the ground ahead
+const AP_YAW_RATE = 0.12           // rad/s at 1x, grows with sqrt(multiplier)
+const AP_BANK_MAX = 0.22
+const wrapPi = (a: number) => Math.atan2(Math.sin(a), Math.cos(a))
+const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
 
 const pathX = (z: number) => 4.5 * Math.sin(z * 0.019634954) + 1.6 * Math.sin(z * 0.039269908 + 1.3)
 const f32 = Math.fround
@@ -144,6 +156,17 @@ export class Engine {
   timeScale = 1
   reanchors = 0
   private route: any = null
+  // autopilot (real places only): drives the free-fly pose `fly`, so manual takeover/handback share one pose
+  private ap = {
+    dest: null as City | null, visited: [] as string[], lap: false, // lap: circle the destination when reached
+    orbit: 0, orbitAcc: 0, orbitPrev: 0,   // orbit: laps in progress (1 = yes), angle travelled around the city (rad)
+    yawRate: 0, bank: 0, vy: 0, spd: -1, // spd: current ground speed in units/s (eases to the target; -1 = take the target)
+    dipT: 0, nextDip: 70, dipping: 0,       // seconds (sim) since the last dip, when the next is due, seconds left in this dip
+    hudAt: 0, drift: 0, minClear: Infinity, lastKmh: 0,
+  }
+  private lastDestStore: any = null
+  private lastTour = false
+  private lon0 = -98                        // longitude where the clock `tod` is the local solar time
   /** Dev: frame interval samples while `perfOn` (ms) and window swap events. */
   perfOn = false
   perfMs: number[] = []
@@ -347,8 +370,11 @@ export class Engine {
     window.addEventListener('blur', this.onBlur)
 
     this.applyGrade()
+    void loadCities().catch(() => {})
     this.unsub = useSettings.subscribe((st) => {
       if (st.manual !== this.manual) this.setManual(st.manual)
+      if (st.tour !== this.lastTour) { this.lastTour = st.tour; if (st.tour && this.geoRef) { const ll = this.llAt(this.fly.x, this.fly.z); this.pickDestination(ll.lat, ll.lon) } }
+      if (st.dest !== this.lastDestStore) { this.lastDestStore = st.dest; if (st.dest) this.setDestination(st.dest as City, true) }
       this.applyGrade()
       if (st.tod !== this.tod) this.tod = st.tod // moved from the panel
       if (st.place !== this.lastPlace) { const p = st.place; this.lastPlace = p; void this.loadPlace(p) }
@@ -448,7 +474,17 @@ export class Engine {
       this.simT = 0 // start the flight over the middle of the place
       this.pathShiftZ = 0
       this.route = null
-      if (this.manual) { this.fly.x = 0; this.fly.z = 0; this.fly.vx = this.fly.vy = this.fly.vz = 0 }
+      if (p) {
+        // start over the middle of the place: the free-fly pose is the autopilot's too
+        const f = this.fly
+        f.x = 0; f.z = 0; f.vx = f.vy = f.vz = 0; f.y = AP_CRUISE_Y; f.pitch = -0.07
+        this.lon0 = p.lon
+        const a = this.ap
+        a.dest = null; a.visited = []; a.orbit = 0; a.yawRate = 0; a.bank = 0; a.vy = 0; a.spd = -1; a.dipT = 0; a.dipping = 0; a.minClear = Infinity
+        S.setState({ dest: null }); this.lastDestStore = null
+        this.pickDestination(p.lat, p.lon)
+        if (a.dest) f.yaw = bearing(p.lat, p.lon, a.dest.lat, a.dest.lon)
+      }
       this.camVel.set(0, 0); this.lastCam.copy(this.camU.uCamPos.value)
     } catch (e: any) {
       if (token !== this.placeToken || e?.name === 'AbortError') return
@@ -594,7 +630,7 @@ export class Engine {
 
   /** Sun position and day/night weights from the time of day (6 = sunrise in the east, 12 = high noon, 18 = sunset). */
   applySun() {
-    const phi = ((this.tod - 6) / 12) * Math.PI
+    const phi = ((this.localHour(this.camLatLon().lon) - 6) / 12) * Math.PI
     const u = this.compPass.u
     const sy = Math.sin(phi)
     u.uSunDir.value.set(Math.cos(phi), sy * 0.9, -0.5 * sy).normalize()
@@ -822,7 +858,12 @@ export class Engine {
       const p = this.camU.uCamPos.value, d = this.camU.uCamF.value
       f.x = p.x; f.y = p.y; f.z = p.z
       f.yaw = Math.atan2(d.x, -d.z); f.pitch = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1))
-      f.vx = f.vy = f.vz = 0
+      if (!this.geoRef) f.vx = f.vy = f.vz = 0 // on a real place the autopilot's velocity carries over and eases out
+    } else if (this.geoRef) {
+      // autopilot takes over from the current position and heading: nothing to snap, the heading eases to the route
+      this.route = null
+      this.keys.clear(); this.dragging = false
+      this.ap.vy = f.vy; this.ap.yawRate = 0; this.ap.spd = Math.hypot(f.vx, f.vz) // speed up from where manual flight left off
     } else {
       this.simT = -f.z / SPEED // rejoin the path at the current point along it
       this.pathShiftZ = 0
@@ -854,8 +895,150 @@ export class Engine {
     f.y = Math.min(Math.max(f.y, this.surfaceY(f.x, f.z) + 0.6), 60)
   }
 
+  // ---- autopilot ----
+  private apOn() { return !!this.geoRef && !this.manual && !this.route }
+  private llAt(x: number, z: number) {
+    const A = this.anchor()
+    return { lat: latOfPy(A.gy0 + z / UNITS_PER_PX, A.z), lon: lonOfPx(A.gx0 + x / UNITS_PER_PX, A.z) }
+  }
+  private mpuAt(z: number) { const A = this.anchor(); return metresPerUnit(A.gy0 + z / UNITS_PER_PX, A.z) }
+
+  /** Fly to this city next (a user choice circles it once on arrival). Also reachable from the store (`dest`). */
+  setDestination(c: City | null, lap = false) {
+    const a = this.ap
+    a.dest = c; a.lap = lap; a.orbit = 0; a.orbitAcc = 0
+    if (c) {
+      this.lastDestStore = c
+      if (useSettings.getState().dest !== c) useSettings.setState({ dest: c as any })
+    }
+  }
+  private pickDestination(lat: number, lon: number) {
+    const a = this.ap
+    if (!getCities().length) return
+    const tour = useSettings.getState().tour
+    const c = pickNext(lat, lon, a.visited, tour ? 'near' : 'random')
+    this.setDestination(c, tour)
+  }
+
+  private stepAutopilot(dt: number) {
+    const f = this.fly, a = this.ap, st = useSettings.getState()
+    const mult = st.apSpeed * this.timeScale
+    const ll = this.llAt(f.x, f.z)
+    if (!a.dest && !a.orbit) this.pickDestination(ll.lat, ll.lon)
+    const vground = AP_BASE_MS * mult
+    const vu = vground / this.mpuAt(f.z)
+    const sq = Math.sqrt(Math.max(mult, 0.05))
+    const maxRate = Math.min(AP_YAW_RATE * sq, 0.4)
+    // --- where to head
+    let want = f.yaw, rateCmd: number | null = null
+    const d = a.dest
+    if (d) {
+      const dist = distanceM(ll.lat, ll.lon, d.lat, d.lon), brg = bearing(ll.lat, ll.lon, d.lat, d.lon)
+      const Ro = vground / maxRate // radius of the lap: a gentle, constant-rate circle
+      if (a.orbit) {
+        const back = bearing(d.lat, d.lon, ll.lat, ll.lon)
+        a.orbitAcc += wrapPi(back - a.orbitPrev); a.orbitPrev = back
+        want = brg - (Math.PI / 2) * (1 - Math.max(-1, Math.min(1, (dist - Ro) / Ro)))
+        if (Math.abs(a.orbitAcc) >= Math.PI * 2) { this.finishVisit() }
+      } else {
+        want = brg
+        const arrive = a.lap ? 2 * Ro : Math.max(4000, vground * 1.5)
+        if (dist < arrive) {
+          if (a.lap) { a.orbit = 1; a.orbitAcc = 0; a.orbitPrev = bearing(d.lat, d.lon, ll.lat, ll.lon) } else this.finishVisit()
+        }
+      }
+    }
+    // --- turn gently, bank into it
+    const err = wrapPi(want - f.yaw)
+    const target = Math.max(-maxRate, Math.min(maxRate, err * 0.7))
+    a.yawRate += (target - a.yawRate) * (1 - Math.exp(-dt * 1.4))
+    f.yaw += a.yawRate * dt
+    const bankT = Math.max(-AP_BANK_MAX, Math.min(AP_BANK_MAX, a.yawRate * 1.5))
+    a.bank += (bankT - a.bank) * (1 - Math.exp(-dt * 1.8))
+    // --- move over the ground
+    const sy = Math.sin(f.yaw), cy = Math.cos(f.yaw)
+    a.spd = a.spd < 0 ? vu : a.spd + (vu - a.spd) * (1 - Math.exp(-dt * 1.2))
+    f.vx = sy * a.spd; f.vz = -cy * a.spd
+    f.x += f.vx * dt; f.z += f.vz * dt
+    // --- altitude: cruise above the deck, now and then dip toward the ground, never closer than AP_FLOOR
+    const look = Math.min(vu * 2.2, 130)
+    let gAhead = this.surfaceY(f.x, f.z), gMin = gAhead
+    for (const s of [0.2, 0.4, 0.7, 1]) {
+      const g = this.surfaceY(f.x + sy * look * s, f.z - cy * look * s)
+      gAhead = Math.max(gAhead, g); gMin = Math.min(gMin, g)
+    }
+    const dtS = dt * Math.sqrt(Math.max(mult, 1))
+    a.drift += dtS
+    a.dipT += dtS
+    if (a.dipping > 0) { a.dipping -= dtS; if (a.dipping <= 0) { a.dipT = 0; a.nextDip = 80 + Math.random() * 80 } }
+    else if (a.dipT > a.nextDip) {
+      // low flight is for interesting terrain: rough ground ahead, not open sea
+      let lo = 1e9, hi = -1e9
+      for (let i = 1; i <= 6; i++) { const g = this.surfaceY(f.x + sy * 18 * i, f.z - cy * 18 * i); lo = Math.min(lo, g); hi = Math.max(hi, g) }
+      if ((hi - lo > 4 &&hi > WATER_Y + 8) || a.dipT > a.nextDip + 120) a.dipping = 26 + Math.random() * 14
+    }
+    const cruise = AP_CRUISE_Y + 1.1 * Math.sin(a.drift * 0.11) + 0.5 * Math.sin(a.drift * 0.37 + 1)
+    const wanted = a.dipping > 0 ? gAhead + AP_DIP_CLEAR : cruise
+    const floor = gAhead + AP_FLOOR
+    const maxV = 2.4 * Math.sqrt(Math.max(mult, 1))
+    let vyT = Math.max(-maxV, Math.min(maxV, (Math.max(wanted, floor + 2) - f.y) * 0.45))
+    if (f.y < floor + 1.5) vyT = Math.max(vyT, Math.min(maxV * 3, (floor + 1.5 - f.y) * 1.5)) // terrain rising: climb now
+    a.vy += (vyT - a.vy) * (1 - Math.exp(-dt * 1.6))
+    f.y += a.vy * dt
+    const here = this.surfaceY(f.x, f.z)
+    f.y = Math.min(Math.max(f.y, here + 1.6, floor - 0.6), 60)
+    f.vy = a.vy
+    const pitchT = Math.max(-0.45, Math.min(0.45, Math.atan2(a.vy, Math.max(vu, 1)))) - 0.07
+    f.pitch += (pitchT - f.pitch) * (1 - Math.exp(-dt * 1.3))
+    a.minClear = Math.min(a.minClear, f.y - here)
+  }
+
+  private finishVisit() {
+    const a = this.ap, d = a.dest
+    if (d) { a.visited.push(cityKey(d)); if (a.visited.length > 40) a.visited.shift() }
+    a.orbit = 0; a.dest = null; a.lap = false
+    // `dest` in the store is a user pick that is now done
+    useSettings.setState({ dest: null }); this.lastDestStore = null
+    const ll = this.llAt(this.fly.x, this.fly.z)
+    this.pickDestination(ll.lat, ll.lon)
+  }
+
+  /** Local solar time at the camera, hours 0..24: the clock `tod` is the local time at the place's longitude. */
+  private localHour(lon: number) {
+    const sync = useSettings.getState().solarSync && !!this.geoRef
+    return (((this.tod + (sync ? wrapPi((lon - this.lon0) * Math.PI / 180) * 12 / Math.PI : 0)) % 24) + 24) % 24
+  }
+
+  private updateHud(now: number) {
+    const a = this.ap
+    if (now < a.hudAt) return
+    a.hudAt = now + 250
+    const st = useSettings.getState()
+    if (!st.hudOn || !this.geoRef) { if (useHud.getState().hud) useHud.setState({ hud: null }); return }
+    const f = this.fly, c = this.camU.uCamPos.value
+    const ll = this.camLatLon()
+    const n = nearestCity(ll.lat, ll.lon)
+    const d = a.dest
+    const here = this.surfaceY(c.x, c.z)
+    const exag = this.geoRef.exag ?? 1
+    const kmh = Math.hypot(this.camVel.x, this.camVel.y) * this.groundMPerUnit() * 3.6
+    useHud.setState({
+      hud: {
+        mode: this.manual ? 'manual' : 'auto', lat: ll.lat, lon: ll.lon,
+        city: n?.city.name ?? '', state: n?.city.state ?? '', cityKm: n ? n.dist / 1000 : 0,
+        cityDir: n ? COMPASS[Math.round(((n.bearing + 2 * Math.PI) % (2 * Math.PI)) / (Math.PI / 4)) % 8] : '',
+        altM: Math.max(0, (c.y - here) * this.groundMPerUnit() / exag),
+        localHour: this.localHour(ll.lon),
+        destName: d ? `${d.name}, ${d.state}` : '', destKm: d ? distanceM(ll.lat, ll.lon, d.lat, d.lon) / 1000 : 0,
+        kmh, orbit: !!a.orbit,
+      },
+    })
+    void f
+  }
+
   private updateFly(dt: number) {
     if (this.route) { this.stepRoute(dt); return }
+    if (this.geoRef && !this.manual) { this.stepAutopilot(dt); return }
     const f = this.fly, k = this.keys
     const cp = Math.cos(f.pitch), sp = Math.sin(f.pitch), sy = Math.sin(f.yaw), cy = Math.cos(f.yaw)
     const fx = sy * cp, fy = sp, fz = -cy * cp // forward, wherever the camera points
@@ -873,12 +1056,17 @@ export class Engine {
 
   private updateCamera(t: number, aspect: number, dt = 0) {
     const { _f, _r, _u, _up, pointer } = this
-    if (this.manual) {
+    if (this.manual || this.apOn() || this.route) {
       this.updateFly(dt)
       const f = this.fly, cp = Math.cos(f.pitch)
       _f.set(Math.sin(f.yaw) * cp, Math.sin(f.pitch), -Math.cos(f.yaw) * cp)
       _up.set(0, 1, 0)
       _r.crossVectors(_f, _up).normalize()
+      if (this.manual || this.route) this.ap.bank *= Math.exp(-dt * 3) // levels out when you take over
+      if (Math.abs(this.ap.bank) > 1e-4) {
+        _up.multiplyScalar(Math.cos(this.ap.bank)).addScaledVector(_r, -Math.sin(this.ap.bank))
+        _r.crossVectors(_f, _up).normalize()
+      }
       _u.crossVectors(_r, _f).normalize()
       this.camU.uCamPos.value.set(f.x, f.y, f.z)
       this.camU.uCamF.value.copy(_f); this.camU.uCamR.value.copy(_r); this.camU.uCamU.value.copy(_u)
@@ -928,7 +1116,7 @@ export class Engine {
     this.frame++
     const st = useSettings.getState()
     if (st.playing) {
-      this.tod = (this.tod + (dt * 24) / Math.max(st.dayLen, 5)) % 24
+      this.tod = (this.tod + (dt * 24 * st.todMult) / Math.max(st.dayLen, 5)) % 24
       this.todSync += dt
       if (this.todSync > 0.25) { this.todSync = 0; useSettings.setState({ tod: this.tod }) }
     }
@@ -938,6 +1126,7 @@ export class Engine {
     }
     this.trackVelocity(dt)
     this.maybeReanchor()
+    this.updateHud(performance.now())
     this.updateRolling()
     this.updateMorph(dt)
     this.render()

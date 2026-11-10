@@ -455,6 +455,7 @@ Nightscape is free to use. If you enjoy it and would like to support further wor
 
 - Lunar map: NASA / GSFC Scientific Visualization Studio, CGI Moon Kit (LRO LROC data). Public domain.
 - Three.js: MIT licence.
+- Cities for the React app's autopilot and HUD (`app/public/cities.json`): US Census Bureau data, public domain.
 
 ## Licence
 
