@@ -31,14 +31,35 @@ reused.
 
 ### N1: Long-distance flight foundation
 Make flights of thousands of km work over real places.
-- [ ] Plan written here
-- [ ] Re-anchor the GeoRef (floating origin) when the camera gets far from it, with no visible jump in
+- [x] Plan written here (below)
+- [x] Re-anchor the GeoRef (floating origin) when the camera gets far from it, with no visible jump in
       clouds, terrain or temporal history
-- [ ] Mercator scale changes with latitude: keep ground scale and vertical scale consistent on long
+- [x] Mercator scale changes with latitude: keep ground scale and vertical scale consistent on long
       north-south flights
-- [ ] Rolling windows load ahead in the direction of travel, with no hitches at speed
-- [ ] Cloud field doesn't visibly repeat on long flights (the 320-unit tile)
-- [ ] Coast-to-coast test: no seams, jumps or precision jitter; build passes
+- [x] Rolling windows load ahead in the direction of travel, with no hitches at speed
+- [x] Cloud field doesn't visibly repeat on long flights (the 320-unit tile)
+- [x] Coast-to-coast test: no seams, jumps or precision jitter; build passes
+
+**N1 plan** (child session `n1-long-flight`):
+1. *Re-anchor.* Shift the world by whole multiples of 1920 units when the camera is >1400 from 0. 1920 is a
+   multiple of the terrain tile (640), the cloud tile (320) and the cloud sample-plane spacing (3.84), so
+   neither baked textures nor cloud sampling move: only `gx0/gy0`, window origin, `uOrigin`, camera
+   (auto path offset + manual `fly`), TAA previous camera shift. No rebake, no TAA reset.
+2. *Mercator scale.* Keep exact Web Mercator at the place's zoom (conformal, continuous, so no pops).
+   Vertical scale becomes a per-row function of latitude (`perMetre = exaggeration / metresPerUnit(lat)`,
+   exaggeration fixed per flight, soft-compressed near the 34-unit relief ceiling), so relief stays
+   proportionate from south to north. Ground scale is exposed (`groundMPerUnit`) for speed/HUD in N2.
+3. *Load ahead.* Window swap is predicted from camera velocity and measured load time; the new window is
+   centred ahead of travel. Tile fetches are de-duplicated and capped; window assembly is time-sliced.
+4. *Cloud repetition.* Low-frequency noise of absolute Mercator position adds a coverage bias (and a mild
+   warp) to the baked shape lookup, so each repeat of the 320 tile differs. No rebake needed.
+5. *Dev helpers.* `__cloudScene.flyTo/teleport/setSpeed/perf/info`.
+
+**N1 result** (branch `claude/n1-long-flight-308162`): re-anchor verified invisible (pixel diff at TAA noise floor);
+fast flights NYC west at 40 u/s and Seattle south at 90 u/s: p99 frame 9.5 ms, 2-3 frames >25 ms per 4000
+(the occasional ~40 ms frame at the end of a window bake is open). Horizontal scale stays Mercator
+(about 1/cos(lat), so ground m/unit grows ~18% from Seattle to the Bay Area); only vertical scale and
+`groundMPerUnit()` compensate. Dev helpers: `__cloudScene.{teleport,flyTo,flyRoute,setSpeed,info,perfStart,perfStop,setCloudVariety}`.
 
 ### N2: Autopilot between cities
 - [ ] Plan written here

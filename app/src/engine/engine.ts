@@ -10,7 +10,7 @@ import {
 } from '../shaders/legacy'
 import { buildNoise } from './noise'
 import { useSettings, hexToLinear, type Clouds, type Place } from '../store/settings'
-import { makeGeoRef, loadTerrainWindow, WIN, REAL_TILE, UNITS_PER_PX, type GeoRef, type TerrainWindow } from '../geo/terrainWindow'
+import { makeGeoRef, loadTerrainWindow, prefetchWindow, metresPerUnit, latOfPy, lonOfPx, pxOfLat, pxOfLon, WIN, REAL_TILE, UNITS_PER_PX, type GeoRef, type TerrainWindow } from '../geo/terrainWindow'
 
 const cloudCfg = (c: Clouds) => {
   const a = (c.windDir * Math.PI) / 180
@@ -32,6 +32,18 @@ const SPEED = 1.25
 const TILE = 320
 const TER_LO = -100, TER_RANGE = 52, WATER_Y = -85
 const SCALE_MIN = 0.26, SCALE_MAX = 0.8
+// Floating origin: when the camera strays more than ANCHOR_LIM from world 0 the world is shifted by whole
+// multiples of ANCHOR_Q. 1920 = 3 x 640 (terrain tile) = 6 x 320 (cloud tile) = 500 x 3.84 (the cloud march's
+// coarsest sample-plane spacing), so every baked texture and every sample plane lines up exactly afterwards.
+const ANCHOR_Q = 1920, ANCHOR_LIM = 1400
+// Large-scale cloud variety: cycles around the world for the two octaves of the absolute-position noise (integers,
+// so the field also wraps cleanly at the date line), and how much each swells/thins the cloud (distance units).
+const BIG_F1 = 51, BIG_F2 = 145
+const BIG_AMP: [number, number] = [8, 5.5]
+// Window look-ahead: terrain beyond ~200 units is never drawn, a window reaches 320 from its centre, so the
+// camera may stray EDGE units from the centre before the edge can show. The next window is requested early
+// enough (from velocity and the measured load time) and is centred ahead of travel by at most AHEAD_MAX.
+const EDGE = 120, AHEAD_MAX = 130
 
 const pathX = (z: number) => 4.5 * Math.sin(z * 0.019634954) + 1.6 * Math.sin(z * 0.039269908 + 1.3)
 const f32 = Math.fround
@@ -41,6 +53,7 @@ function hash12js(x: number, y: number) {
   const k = f32(a * (b + 33.33) + b * (a + 33.33) + a * (a + 33.33))
   return fract(f32((a + k + b + k) * (a + k)))
 }
+let HALF_LUT: Float32Array | null = null
 function halfToFloat(h: number) {
   const e = (h >> 10) & 31, m = h & 1023
   const v = e === 0 ? m * 5.960464477539063e-8 : (1 + m / 1024) * Math.pow(2, e - 15)
@@ -87,7 +100,10 @@ export class Engine {
   private histA: any = null; private histB: any = null; private carryHist: any = null
   // cloud volumes: shape (distance field) and lighting, each as a "from" (on screen) and "to" (being grown into)
   private shapeFrom: any; private shapeTo: any; private lightFrom: any; private lightTo: any
-  private morphU = { uBake: { value: null as any }, uBake2: { value: null as any }, uLight: { value: null as any }, uLight2: { value: null as any }, uMorph: { value: 0 } }
+  private morphU = {
+    uBake: { value: null as any }, uBake2: { value: null as any }, uLight: { value: null as any }, uLight2: { value: null as any }, uMorph: { value: 0 },
+    uBigO: { value: new THREE.Vector4() }, uBigK: { value: new THREE.Vector2() }, uBigAmp: { value: new THREE.Vector2(BIG_AMP[0], BIG_AMP[1]) },
+  }
   private morphT = -1                    // seconds into a morph, -1 when none
   private morphDur = 12
   private pending: Clouds | null = null  // a change made during a morph, baked once it ends
@@ -116,10 +132,28 @@ export class Engine {
   }
   private terTile = 320
   private geoRef: GeoRef | null = null
+  // anchor used while there is no real place, so the cloud field's absolute position keeps counting
+  private virtRef = { z: 10, gx0: pxOfLon(-98, 10), gy0: pxOfLat(39, 10) }
+  private pathShiftZ = 0                    // auto path: z = -simT * SPEED + pathShiftZ (kept across re-anchors)
+  private lastCam = new THREE.Vector3()
+  private camVel = new THREE.Vector2()      // smoothed camera velocity in world units / s (x, z)
+  private loadEma = 3                       // seconds a window takes from request to ready
+  private loadStart = 0
+  private prefetchAt = 0
+  /** Dev: multiplies flight speed (auto path, WASD, routes). */
+  timeScale = 1
+  reanchors = 0
+  private route: any = null
+  /** Dev: frame interval samples while `perfOn` (ms) and window swap events. */
+  perfOn = false
+  perfMs: number[] = []
+  perfEvents: any[] = []
   private winOrigin = new THREE.Vector2()   // world position of the loaded real window's centre
   private winBusy = false
   private winRetryAt = 0
   private pendingWin: { win: TerrainWindow; token: number } | null = null
+  private winHalf: Uint16Array | null = null
+  private rhBuf: Float32Array | null = null; private rhRow = 0; private rhCol: Int32Array | null = null; private rhOx = 0; private rhOy = 0
   private terrainRolling = false            // a re-centring bake while flying (no fade)
   private lastPlace: Place | null = null
   private placeToken = 0
@@ -138,6 +172,7 @@ export class Engine {
   // free-fly camera
   private manual = false
   private lastDt = 0
+  private lastRaw = 0
   private fly = { x: 0, y: 3.6, z: 0, yaw: 0, pitch: 0, vx: 0, vy: 0, vz: 0 }
   private keys = new Set<string>()
   private dragging = false
@@ -286,7 +321,7 @@ export class Engine {
 
     const isUI = (t: EventTarget | null) => !!(t as HTMLElement)?.closest?.('[data-ui]')
     const isField = (t: EventTarget | null) => /^(INPUT|TEXTAREA|SELECT)$/.test((t as HTMLElement)?.tagName ?? '')
-    this.onDown = (e) => { if (e.button === 0 && !isUI(e.target)) { this.dragging = true; this.setManual(true) } }
+    this.onDown = (e) => { if (e.button === 0 && !isUI(e.target)) { this.dragging = true; if (!this.route?.lock) this.route = null; this.setManual(true) } }
     this.onUp = () => { this.dragging = false }
     this.onDragMove = (e) => {
       if (!this.dragging || !this.manual) return
@@ -297,7 +332,7 @@ export class Engine {
     this.onKeyDown = (e) => {
       if (isField(e.target) || e.ctrlKey || e.metaKey || e.altKey) return
       const k = e.key.toLowerCase()
-      if ('wasdqe'.includes(k) && k.length === 1) { this.keys.add(k); this.setManual(true); e.preventDefault() }
+      if ('wasdqe'.includes(k) && k.length === 1) { this.keys.add(k); if (!this.route?.lock) this.route = null; this.setManual(true); e.preventDefault() }
       else if (k === 'shift') this.keys.add('shift')
       else if (k === 'r') this.setManual(false)
     }
@@ -363,12 +398,14 @@ export class Engine {
       return t
     }
     this.terU.uReal.value.dispose(); this.terU.uImg.value.dispose()
+    this.winHalf = win.half; this.rhBuf = null
     this.terU.uReal.value = mk(win.half, THREE.RedFormat, THREE.HalfFloatType, 2)
     this.terU.uImg.value = mk(win.rgba, THREE.RGBAFormat, THREE.UnsignedByteType, 1)
     // where the window's centre sits in the world (and so in the repeating terrain tile)
     this.winOrigin.set((win.cx - ref.gx0) * UNITS_PER_PX, (win.cy - ref.gy0) * UNITS_PER_PX)
     this.terU.uOrigin.value.set(this.winOrigin.x / REAL_TILE, this.winOrigin.y / REAL_TILE)
     this.terU.uUseReal.value = 1
+    this.updateBigField()
     this.terU.uTT.value = this.terTile = REAL_TILE
     this.terJob = 0
     this.terrainActive = true
@@ -391,6 +428,7 @@ export class Engine {
         await sleep(450)
         if (token !== this.placeToken) return
         this.geoRef = null
+        this.updateBigField()
         this.terU.uUseReal.value = 0
         this.terU.uTT.value = this.terTile = 320
         this.terJob = 0
@@ -408,32 +446,112 @@ export class Engine {
         S.setState({ placeInfo: `${Math.round(ref.windowKm)} km wide view, ${lo} to ${hi} m, relief drawn ${ref.exaggeration.toFixed(1)}x taller than true` })
       }
       this.simT = 0 // start the flight over the middle of the place
+      this.pathShiftZ = 0
+      this.route = null
+      if (this.manual) { this.fly.x = 0; this.fly.z = 0; this.fly.vx = this.fly.vy = this.fly.vz = 0 }
+      this.camVel.set(0, 0); this.lastCam.copy(this.camU.uCamPos.value)
     } catch (e: any) {
       if (token !== this.placeToken || e?.name === 'AbortError') return
       S.setState({ placeStatus: 'error', placeInfo: String(e?.message ?? e), fade: 0 })
     }
   }
 
+  private anchor() { return this.geoRef ?? this.virtRef }
+
+  /** Ground metres that one world unit stands for at the camera (Mercator stretches the map by 1/cos(lat)). */
+  groundMPerUnit() { const A = this.anchor(); return metresPerUnit(A.gy0 + this.camU.uCamPos.value.z / UNITS_PER_PX, A.z) }
+  /** Camera latitude / longitude, degrees. */
+  camLatLon() {
+    const A = this.anchor(), c = this.camU.uCamPos.value
+    return { lat: latOfPy(A.gy0 + c.z / UNITS_PER_PX, A.z), lon: lonOfPx(A.gx0 + c.x / UNITS_PER_PX, A.z) }
+  }
+
   /**
-   * While flying over a real place, fetch a fresh window around the camera once it has moved a good
-   * way from the centre of the loaded one, and bake it in quietly. The world-to-map mapping is the
-   * same, so the terrain already on screen does not change and the land just keeps going.
+   * Cloud-field phase for the camera's absolute position. Mercator pixels / (2^z * 256) is the same number at any zoom,
+   * so the field belongs to the Earth, not to a window. The phases are reduced in double precision here: the
+   * shader only ever adds a small local offset to a number in 0..1.
+   */
+  private updateBigField() {
+    const A = this.anchor(), W = 2 ** A.z * 256
+    const mx = A.gx0 / W, my = A.gy0 / W
+    const fr = (v: number) => v - Math.floor(v)
+    const u = this.morphU
+    u.uBigO.value.set(fr(mx * BIG_F1), fr(my * BIG_F1), fr(mx * BIG_F2), fr(my * BIG_F2))
+    const perUnit = 1 / (UNITS_PER_PX * W)
+    u.uBigK.value.set(BIG_F1 * perUnit, BIG_F2 * perUnit)
+  }
+
+  /** Shift the world by (sx, sz) (multiples of ANCHOR_Q) so the camera is back near 0. Invisible by construction. */
+  private reanchor(sx: number, sz: number) {
+    const A = this.anchor()
+    A.gx0 += sx / UNITS_PER_PX; A.gy0 += sz / UNITS_PER_PX
+    if (this.geoRef) {
+      this.winOrigin.x -= sx; this.winOrigin.y -= sz
+      this.terU.uOrigin.value.set(this.winOrigin.x / REAL_TILE, this.winOrigin.y / REAL_TILE) // a whole number of tiles different: same fract()
+    }
+    this.fly.x -= sx; this.fly.z -= sz
+    this.pathShiftZ -= sz
+    const sub = (v: THREE.Vector3) => { v.x -= sx; v.z -= sz }
+    sub(this.camU.uCamPos.value); sub(this.taaPass.u.uPrevPos.value); sub(this.lastCam)
+    this.updateBigField()
+    this.reanchors++
+    if (this.perfOn) this.perfEvents.push({ t: this.clock, frame: this.frame, kind: 'reanchor', sx, sz })
+  }
+
+  private maybeReanchor() {
+    const c = this.camU.uCamPos.value
+    const sx = Math.abs(c.x) > ANCHOR_LIM ? Math.round(c.x / ANCHOR_Q) * ANCHOR_Q : 0
+    const sz = Math.abs(c.z) > ANCHOR_LIM ? Math.round(c.z / ANCHOR_Q) * ANCHOR_Q : 0
+    if (sx || sz) this.reanchor(sx, sz)
+  }
+
+  private trackVelocity(raw: number) {
+    const c = this.camU.uCamPos.value
+    if (raw > 0 && this.frame > 2) {
+      const dt = Math.min(raw, 0.25), a = 1 - Math.exp(-dt / 0.35)
+      this.camVel.x += ((c.x - this.lastCam.x) / dt - this.camVel.x) * a
+      this.camVel.y += ((c.z - this.lastCam.z) / dt - this.camVel.y) * a
+    }
+    this.lastCam.copy(c)
+  }
+
+  /**
+   * While flying over a real place, fetch a fresh window before the edge of the loaded one can come into view, and
+   * bake it in quietly. The world-to-map mapping is the same, so the terrain already on screen does not change and
+   * the land just keeps going. The request is timed from the camera velocity and the measured load time, and the
+   * window is centred ahead of travel (so it lasts longer). While it is not due, the tiles it will need are prefetched.
    */
   private updateRolling() {
     const ref = this.geoRef
     if (!ref || this.terrainActive) return
+    const now = performance.now()
     if (this.pendingWin) {
       const w = this.pendingWin
       this.pendingWin = null; this.winBusy = false
-      if (w.token === this.placeToken) this.applyWindow(w.win, true)
+      this.loadEma = 0.6 * this.loadEma + 0.4 * Math.min((now - this.loadStart) / 1000, 20)
+      if (w.token === this.placeToken) {
+        this.applyWindow(w.win, true)
+        if (this.perfOn) this.perfEvents.push({ t: this.clock, frame: this.frame, kind: 'window', loadMs: Math.round(now - this.loadStart) })
+      }
       return
     }
-    if (this.winBusy || performance.now() < this.winRetryAt) return
-    const c = this.camU.uCamPos.value
-    if (Math.max(Math.abs(c.x - this.winOrigin.x), Math.abs(c.z - this.winOrigin.y)) < 120) return
-    this.winBusy = true
+    if (this.winBusy || now < this.winRetryAt) return
+    const c = this.camU.uCamPos.value, v = this.camVel, wo = this.winOrigin
+    const lead = Math.min(this.loadEma * 1.4 + 0.8, 14) // seconds between the request and the window being ready
+    const MARGIN = 8
+    // d = camera offset from the window centre. Moving: only the edge ahead matters (it must stay out of view for
+    // `lead` more seconds), while the window may trail behind the camera by up to AHEAD_MAX + 20. At rest: either edge.
+    const due = (d: number, vel: number) => Math.abs(vel) < 2
+      ? Math.abs(d) > EDGE - MARGIN
+      : (vel > 0 ? EDGE - d : EDGE + d) < Math.abs(vel) * lead + MARGIN || Math.abs(d) > EDGE + AHEAD_MAX + 20
+    const ahead = (vel: number) => Math.max(-AHEAD_MAX, Math.min(AHEAD_MAX, vel * (lead + 3)))
+    const cx = Math.round(ref.gx0 + (c.x + ahead(v.x)) / UNITS_PER_PX), cy = Math.round(ref.gy0 + (c.z + ahead(v.y)) / UNITS_PER_PX)
+    if (!(due(c.x - wo.x, v.x) || due(c.z - wo.y, v.y))) {
+      if (Math.hypot(v.x, v.y) > 0.5 && now > this.prefetchAt) { this.prefetchAt = now + 1500; prefetchWindow(ref, cx, cy, this.placeAbort?.signal) }
+      return
+    }
+    this.winBusy = true; this.loadStart = now
     const token = this.placeToken
-    const cx = Math.round(ref.gx0 + c.x / UNITS_PER_PX), cy = Math.round(ref.gy0 + c.z / UNITS_PER_PX)
     loadTerrainWindow(ref, cx, cy, this.placeAbort?.signal)
       .then((win) => { if (token === this.placeToken) this.pendingWin = { win, token }; else this.winBusy = false })
       .catch(() => { this.winBusy = false; this.winRetryAt = performance.now() + 5000 })
@@ -596,6 +714,7 @@ export class Engine {
     }
     // scissor off so the targets render fully afterwards
     for (const rt of [this.terH, this.terA, this.terB, this.terC, this.terL]) rt.scissorTest = false
+    if (this.terrainRolling && this.winHalf) return this.rollHeights()
     const half = this.terH.texture.type === THREE.HalfFloatType
     const buf = half ? new Uint16Array(TER_N * TER_N * 4) : new Uint8Array(TER_N * TER_N * 4)
     r.readRenderTargetPixels(this.terH, 0, 0, TER_N, TER_N, buf)
@@ -609,6 +728,39 @@ export class Engine {
     this.groundPass.u.uTerTop.value = top + 0.3
     this.placeMasts()
     r.setRenderTarget(null)
+    return true
+  }
+
+  /**
+   * Heights for the CPU (camera ground clamp, mast spots) after a rolling window swap. A GPU read-back of the baked
+   * height target stalls a frame for ~45 ms, so the same heights are rebuilt from the window's own elevation data
+   * instead (without the fine noise and lake carving, which the camera clamp does not need), 128 rows per frame.
+   */
+  private rollHeights(): boolean {
+    const N = TER_N
+    if (!this.rhBuf) {
+      if (!HALF_LUT) { HALF_LUT = new Float32Array(65536); for (let i = 0; i < 65536; i++) HALF_LUT[i] = halfToFloat(i) }
+      this.rhBuf = new Float32Array(N * N); this.rhRow = 0
+      const o = this.terU.uOrigin.value, fr = (v: number) => v - Math.floor(v)
+      this.rhCol = new Int32Array(N)
+      for (let i = 0; i < N; i++) this.rhCol[i] = Math.min(N - 1, Math.floor(fr((i + 0.5) / N - o.x + 0.5) * N))
+      this.rhOx = o.x; this.rhOy = o.y
+    }
+    const fr = (v: number) => v - Math.floor(v), half = this.winHalf!, H = this.rhBuf, col = this.rhCol!
+    const end = Math.min(N, this.rhRow + 128)
+    for (let j = this.rhRow; j < end; j++) {
+      const wj = Math.min(N - 1, Math.floor(fr((j + 0.5) / N - this.rhOy + 0.5) * N)) * N
+      for (let i = 0; i < N; i++) H[j * N + i] = TER_LO + HALF_LUT![half[wj + col[i]]] * TER_RANGE
+    }
+    this.rhRow = end
+    if (end < N) return false
+    let top = -1e9
+    for (let i = 0; i < N * N; i++) if (H[i] > top) top = H[i]
+    this.terHeights = H
+    this.rhBuf = null
+    this.groundPass.u.uTerTop.value = top + 0.7
+    this.placeMasts()
+    this.renderer.setRenderTarget(null)
     return true
   }
 
@@ -662,22 +814,48 @@ export class Engine {
   /** Switch between the automatic path and free flight, continuing from where the camera is. */
   private setManual(on: boolean) {
     if (on === this.manual) return
+    if (!on && this.route?.lock) return
     this.manual = on
     const f = this.fly
     if (on) {
+      this.camVel.set(0, 0)
       const p = this.camU.uCamPos.value, d = this.camU.uCamF.value
       f.x = p.x; f.y = p.y; f.z = p.z
       f.yaw = Math.atan2(d.x, -d.z); f.pitch = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1))
       f.vx = f.vy = f.vz = 0
     } else {
       this.simT = -f.z / SPEED // rejoin the path at the current point along it
+      this.pathShiftZ = 0
+      this.route = null
       this.keys.clear(); this.dragging = false
       this.taaPass.u.uReset.value = 1
     }
     if (useSettings.getState().manual !== on) useSettings.setState({ manual: on })
   }
 
+  /** Dev autopilot: fly straight (in map space) to the next waypoint at `speed` units/s x timeScale. */
+  private stepRoute(dt: number) {
+    const f = this.fly, r = this.route, A = this.anchor()
+    const tgt = r.pts[r.i]
+    const dx = (tgt.x - A.gx0) * UNITS_PER_PX - f.x, dz = (tgt.y - A.gy0) * UNITS_PER_PX - f.z
+    const dist = Math.hypot(dx, dz)
+    if (dist < 8) {
+      if (++r.i >= r.pts.length) { const done = r.resolve; this.route = null; f.vx = f.vz = 0; done?.(); return }
+      return
+    }
+    const want = Math.atan2(dx, -dz)
+    let dy = want - f.yaw; dy = Math.atan2(Math.sin(dy), Math.cos(dy))
+    f.yaw += dy * Math.min(1, dt * 2.5)
+    const sp = Math.min(r.speed * this.timeScale, dist / Math.max(dt, 1e-3))
+    f.vx = (dx / dist) * sp; f.vz = (dz / dist) * sp
+    f.x += f.vx * dt; f.z += f.vz * dt
+    f.pitch += (-0.22 - f.pitch) * Math.min(1, dt * 2)
+    f.y += (r.alt - f.y) * Math.min(1, dt * 1.5)
+    f.y = Math.min(Math.max(f.y, this.surfaceY(f.x, f.z) + 0.6), 60)
+  }
+
   private updateFly(dt: number) {
+    if (this.route) { this.stepRoute(dt); return }
     const f = this.fly, k = this.keys
     const cp = Math.cos(f.pitch), sp = Math.sin(f.pitch), sy = Math.sin(f.yaw), cy = Math.cos(f.yaw)
     const fx = sy * cp, fy = sp, fz = -cy * cp // forward, wherever the camera points
@@ -685,7 +863,7 @@ export class Engine {
     const fwd = (k.has('w') ? 1 : 0) - (k.has('s') ? 1 : 0)
     const str = (k.has('d') ? 1 : 0) - (k.has('a') ? 1 : 0)
     const rise = (k.has('e') ? 1 : 0) - (k.has('q') ? 1 : 0)
-    const sp0 = (k.has('shift') ? 24 : 8)
+    const sp0 = (k.has('shift') ? 24 : 8) * this.timeScale
     const tx = (fx * fwd + rx * str) * sp0, ty = (fy * fwd + rise) * sp0, tz = (fz * fwd + rz * str) * sp0
     const a = 1 - Math.exp(-dt * 5) // ease in and out
     f.vx += (tx - f.vx) * a; f.vy += (ty - f.vy) * a; f.vz += (tz - f.vz) * a
@@ -706,7 +884,7 @@ export class Engine {
       this.camU.uCamF.value.copy(_f); this.camU.uCamR.value.copy(_r); this.camU.uCamU.value.copy(_u)
       return
     }
-    const z = -t * SPEED
+    const z = -t * SPEED + this.pathShiftZ
     const x = pathX(z)
     const y = 3.6 + 0.3 * Math.sin(t * 0.071) + 0.09 * Math.sin(t * 0.19 + 1.0)
     const look = 16
@@ -743,7 +921,9 @@ export class Engine {
     }
     const dt = Math.min(rawDt, 0.1)
     this.lastDt = dt
-    if (!this.manual) this.simT += dt * (this.reduceMotion ? 0.35 : 1.0)
+    this.lastRaw = rawDt
+    if (!this.manual) this.simT += dt * (this.reduceMotion ? 0.35 : 1.0) * this.timeScale
+    if (this.perfOn && rawDt < 2) this.perfMs.push(rawDt * 1000)
     this.clock += dt
     this.frame++
     const st = useSettings.getState()
@@ -756,6 +936,8 @@ export class Engine {
     for (let i = 0, per = this.terrainRolling ? 2 : 8; i < per && this.terrainActive; i++) {
       if (this.terrainStep()) { this.terrainActive = false; this.onTerrainDone() }
     }
+    this.trackVelocity(dt)
+    this.maybeReanchor()
     this.updateRolling()
     this.updateMorph(dt)
     this.render()
@@ -787,6 +969,55 @@ export class Engine {
       if (this.pending) this.startBake(this.pending)
     }
   }
+
+  // ---- dev helpers (exposed as window.__cloudScene by EngineHost) ----
+  /** State of the long-distance machinery, for the console. */
+  info() {
+    const A = this.anchor(), c = this.camU.uCamPos.value, ll = this.camLatLon()
+    return {
+      lat: +ll.lat.toFixed(4), lon: +ll.lon.toFixed(4), zoom: A.z, camera: [c.x, c.y, c.z].map((v) => +v.toFixed(1)),
+      anchorPx: [A.gx0, A.gy0], reanchors: this.reanchors, windowSwaps: this.timings.windowSwaps ?? 0,
+      groundMPerUnit: +this.groundMPerUnit().toFixed(1), unitsPerSecond: +Math.hypot(this.camVel.x, this.camVel.y).toFixed(2),
+      kmPerSecond: +((Math.hypot(this.camVel.x, this.camVel.y) * this.groundMPerUnit()) / 1000).toFixed(2),
+      windowLoadSeconds: +this.loadEma.toFixed(2), timeScale: this.timeScale, exag: this.geoRef?.exag ?? null, fps: Math.round(this.fps),
+    }
+  }
+  /** Multiply flight speed (auto path, WASD, routes). 1 = normal. */
+  setSpeed(m: number) { this.timeScale = Math.max(0, m); return this.timeScale }
+  /** Load a place and start there (same as picking it in the Place tab). Resolves when it is ready. */
+  teleport(lat: number, lon: number, name = 'dev') {
+    useSettings.getState().setPlace({ name, lat, lon })
+    return new Promise<void>((resolve) => {
+      const t0 = performance.now()
+      const iv = setInterval(() => {
+        const st = useSettings.getState()
+        if ((st.placeStatus === 'ready' && st.fade === 0 && this.geoRef && !this.terrainActive) || st.placeStatus === 'error' || performance.now() - t0 > 60000) { clearInterval(iv); resolve() }
+      }, 100)
+    })
+  }
+  /** Fly (manual camera, straight in map space) through [lat, lon] waypoints at `speed` units/s x timeScale. Any key or drag cancels (unless opts.lock). */
+  flyRoute(points: [number, number][], opts: { speed?: number; alt?: number; lock?: boolean } = {}) {
+    const A = this.anchor()
+    if (!this.geoRef) return Promise.reject(new Error('load a real place first (teleport)'))
+    this.setManual(true)
+    return new Promise<void>((resolve) => {
+      this.route = { pts: points.map(([la, lo]) => ({ x: pxOfLon(lo, A.z), y: pxOfLat(la, A.z) })), i: 0, speed: opts.speed ?? 24, alt: opts.alt ?? 5, lock: !!opts.lock, resolve }
+    })
+  }
+  flyTo(lat: number, lon: number, opts: { speed?: number; alt?: number; lock?: boolean } = {}) { return this.flyRoute([[lat, lon]], opts) }
+  /** Record frame intervals (ms) until perfStop(). */
+  perfStart() { this.perfMs = []; this.perfEvents = []; this.perfOn = true }
+  perfStop() {
+    this.perfOn = false
+    const a = [...this.perfMs].sort((x, y) => x - y), n = a.length
+    const q = (p: number) => +(a[Math.min(n - 1, Math.floor(n * p))] ?? 0).toFixed(1)
+    return {
+      frames: n, meanMs: +(a.reduce((x, y) => x + y, 0) / Math.max(n, 1)).toFixed(2), p50: q(0.5), p95: q(0.95), p99: q(0.99), maxMs: +(a[n - 1] ?? 0).toFixed(1),
+      over25ms: a.filter((x) => x > 25).length, over40ms: a.filter((x) => x > 40).length, events: this.perfEvents,
+    }
+  }
+  /** Strength of the large-scale cloud variety (distance units; 0, 0 turns it off). */
+  setCloudVariety(a: number, b: number) { this.morphU.uBigAmp.value.set(a, b) }
 
   /** Deterministic stepping for the offline recorder. */
   advance(dt: number) { this.step(dt) }

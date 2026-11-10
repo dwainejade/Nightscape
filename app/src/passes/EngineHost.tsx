@@ -3,7 +3,7 @@ import { useFrame, useThree } from '@react-three/fiber'
 import { Engine } from '../engine/engine'
 import { useSettings } from '../store/settings'
 
-declare global { interface Window { __cloudScene?: { advance: (dt: number) => void; settings: typeof useSettings; timings: () => Record<string, number> } } }
+declare global { interface Window { __cloudScene?: any } }
 
 /** Owns the Engine and renders it each frame. A positive useFrame priority makes R3F skip its own render. */
 export function EngineHost({ onProgress }: { onProgress: (p: number) => void }) {
@@ -17,7 +17,13 @@ export function EngineHost({ onProgress }: { onProgress: (p: number) => void }) 
     const e = new Engine(gl)
     engine.current = e
     e.resize(size.width, size.height, dpr)
-    window.__cloudScene = { advance: (dt) => e.advance(dt), settings: useSettings, timings: () => e.timings }
+    window.__cloudScene = {
+      advance: (dt: number) => e.advance(dt), settings: useSettings, timings: () => e.timings, engine: e,
+      // long-distance flight helpers: teleport(lat, lon), flyTo(lat, lon, {speed, alt}), flyRoute([[lat, lon], ...]), setSpeed(mult),
+      // info(), perfStart() / perfStop(), setCloudVariety(a, b)
+      teleport: e.teleport.bind(e), flyTo: e.flyTo.bind(e), flyRoute: e.flyRoute.bind(e), setSpeed: e.setSpeed.bind(e), info: e.info.bind(e),
+      perfStart: e.perfStart.bind(e), perfStop: e.perfStop.bind(e), setCloudVariety: e.setCloudVariety.bind(e),
+    }
     return () => { e.dispose(); engine.current = null; delete window.__cloudScene }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gl])
