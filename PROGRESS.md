@@ -126,6 +126,10 @@ stronger dark-underside gradient and a slight warm/cool tint; halved at night. D
 bright and heavy clouds side by side; 120 fps in the preview. Still to do: finer surface detail octaves, a second (stratocumulus) layer, daytime tuning of
 the neutral grey (undersides are still a bit blue).
 
+**N2 follow-up: MSFS-style clouds (2 of 2)** Finer surface creases (two extra detail reads, near the camera only); `stratSD`: a second, higher layer
+of flat-bottomed stratocumulus in long rows (base y~19-21, follows `cover`/`deckH`), so cruise (y 6.5) flies between two decks; daytime ambient made
+neutral grey instead of blue. Checked at noon from cruise (layered sky, grey-white shades) and from above (y 30); 120 fps in the preview.
+
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here
 - [ ] Real lights from NASA Black Marble (GIBS WMTS, public domain, keyless) in the terrain window,

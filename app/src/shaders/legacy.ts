@@ -258,20 +258,31 @@ float wideCloud(vec3 p, float bil, float lob){
   return best;
 }
 
+// A second, higher layer: flat-bottomed stratocumulus in long rows (stretched along x), with sky between. Sits above
+// the cruise height so you fly between the two decks.
+float stratSD(vec3 p, float bil){
+  float n1 = texture(uNoise, vec3(p.x * (2.0 / TILE) + 0.13, p.z * (7.0 / TILE) + 0.71, 0.29)).b;
+  float n2 = texture(uNoise, vec3(p.x * (9.0 / TILE), p.z * (24.0 / TILE) + 0.37, 0.57)).r;
+  float k = smoothstep(0.44, 0.60, n1 + (uCover - 0.5) * 0.5 + (n2 - 0.5) * 0.18);
+  float base = 19.0 + 2.0 * n1 + uDeckH;
+  float top = mix(base - 3.0, base + 2.2 + 3.2 * n2, k) + (bil - 0.5) * 1.4;
+  return min(top - p.y, p.y - (base - (bil - 0.5) * 0.8));
+}
+
 float sceneSD(vec3 p){
   float bil = billow(p);
   float lob = lobes(p);
   float sea = (p.y > SEA_TOP) ? min(SEA_TOP - p.y, -0.4) : seaSD(p, bil);
   float tw = towers(p, bil, lob);
   float cb = cumulonimbus(p, bil, lob);
-  return smax(smax(smax(sea, tw, 0.9), cb, 1.2), wideCloud(p, bil, lob), 1.2);
+  return smax(smax(smax(smax(sea, tw, 0.9), cb, 1.2), wideCloud(p, bil, lob), 1.2), stratSD(p, bil), 0.6);
 }
 // Same field without the above-the-deck shortcut, which is only a bound for skipping
 // and must not be baked as if it were real cloud.
 float sceneSDFull(vec3 p){
   float bil = billow(p);
   float lob = lobes(p);
-  return smax(smax(smax(seaSD(p, bil), towers(p, bil, lob), 0.9), cumulonimbus(p, bil, lob), 1.2), wideCloud(p, bil, lob), 1.2);
+  return smax(smax(smax(smax(seaSD(p, bil), towers(p, bil, lob), 0.9), cumulonimbus(p, bil, lob), 1.2), wideCloud(p, bil, lob), 1.2), stratSD(p, bil), 0.6);
 }
 float densLight(float sd){ return clamp((sd + 0.1) * 1.3, 0.0, 1.0); }
 `;
@@ -839,8 +850,8 @@ void main(){
   float sunUp = smoothstep(0.0, 0.4, uSunDir.y);
   float skyS = daySkyScale(uSunDir);
   vec3 sunCol = mix(vec3(1.0, 0.45, 0.2), vec3(1.0, 0.96, 0.88), sunUp) * smoothstep(0.0, 0.12, uSunDir.y);
-  vec3 ambLoD = vec3(0.16, 0.20, 0.30) * skyS;   // under a cloud: the dim light bounced up from the land
-  vec3 ambHiD = vec3(0.80, 0.98, 1.30) * skyS;   // on top: the open sky
+  vec3 ambLoD = vec3(0.21, 0.23, 0.27) * skyS;   // under a cloud: the dim light bounced up from the land
+  vec3 ambHiD = vec3(0.92, 1.0, 1.2) * skyS;   // on top: the open sky
   vec3 fogC = mix(skyBase(rd, uMoonDir) * 0.94, daySkyBase(rd, uSunDir, uTwi) * skyS * 0.94 * invL, uDayAmt);
   vec3 AIR_C = mix(vec3(0.0060, 0.0112, 0.0245) * 0.94,   // the sky's plain horizon blue
                    daySkyBase(normalize(vec3(-uSunDir.x, 0.1, -uSunDir.z)), uSunDir, uTwi) * skyS * 0.94 * invL, uDayAmt);
@@ -908,6 +919,11 @@ void main(){
     float d = 0.0;
     if (sd > -0.3){
       float er = (1.0 - detailN(p)) * 0.36 * smoothstep(170.0, 100.0, t);
+      // finer creases between the lobes, only where they can be seen (each is one more texture read)
+      if (t < 90.0){
+        er += (1.0 - texture(uNoise, p * (2.3 * F_DET) + vec3(0.31, 0.57, 0.13)).g) * 0.17 * smoothstep(90.0, 40.0, t);
+        if (t < 40.0) er += (1.0 - texture(uNoise, p * (5.1 * F_DET) + vec3(0.77, 0.21, 0.49)).g) * 0.08 * smoothstep(40.0, 15.0, t);
+      }
       // Far out one sample stands for a thick slab, so with a sharp density ramp a thin
       // wisp's tiny shift on its sample plane becomes a big jump in opacity from one frame
       // to the next. The ramp widens with distance to keep those changes gradual.
