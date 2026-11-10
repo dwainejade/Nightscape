@@ -219,11 +219,24 @@ float bakeAt(vec3 uvw, vec3 p){
   if (uMorph <= 0.0) return a;
   return mix(a, texture(uBake2, uvw).r, morphAt(p));
 }
+// Large-scale variety. The baked field repeats every TILE, so on a long flight the same clouds come round
+// again; a slow noise of the ABSOLUTE position (Mercator, so it is unchanged by re-anchoring and by moving to
+// another window) swells or thins the cloud from region to region. Two octaves (uBigK, cycles per world unit,
+// with their phase uBigO already reduced in double precision on the CPU); amplitudes uBigAmp in distance units.
+uniform vec4 uBigO;
+uniform vec2 uBigK;
+uniform vec2 uBigAmp;
+float gBias = 0.0;   // set once per march step (cloud pass), read by every shape lookup near that point
+float bigBias(vec2 xz){
+  float a = texture(uNoise, vec3(uBigO.xy + xz * uBigK.x, 0.29)).b - 0.5;
+  float b = texture(uNoise, vec3(uBigO.zw + xz * uBigK.y, 0.71)).b - 0.5;
+  return a * uBigAmp.x + b * uBigAmp.y;
+}
 float bakedSD(vec3 p){
   float w = (p.y - Y_MIN) / (Y_MAX - Y_MIN);
   if (w >= 1.0) return -4.0 - (p.y - Y_MAX);
   if (w < 0.0) return -6.0;                  // below the deck: clear air down to the sea
-  return bakeAt(vec3(p.x / TILE, p.z / TILE, w), p) * 16.0 - 10.0;
+  return bakeAt(vec3(p.x / TILE, p.z / TILE, w), p) * 16.0 - 10.0 + gBias;
 }
 float shapeSD(vec3 p){
   float sd = bakedSD(p);
@@ -777,6 +790,7 @@ void main(){
   for (int i = 0; i < 300; i++){
     if (t > tMax || T < 0.012) break;
     vec3 p = ro + rd * t;
+    gBias = bigBias(p.xz);
     float sd = shapeSD(p);
     float spB = planar ? planeSpacing(t * rz) : 0.0;
     // Near a cloud surface, step on a 4x finer set of (still world-fixed) planes so
@@ -942,7 +956,7 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
   // is the moon hidden from this spot by the deck above?
   vec3 pc = po + uMoonDir * ((CLOUD_BASE + 1.0 - po.y) / uMoonDir.y);
   float aC = texture(uNoise, vec3(pc.xz * F_A, 0.137)).b;
-  float open = 1.0 - smoothstep(0.42, 0.52, coverageAt(pc.xz, aC));
+  float open = 1.0 - smoothstep(0.42, 0.52, coverageAt(pc.xz, aC) + bigBias(pc.xz) * 0.03);
   float lit = mix(0.12, 1.0, open);
   const vec3 MOON_G = vec3(1.10, 1.22, 1.42);       // moonlight on the ground
   const vec3 SKY_G = vec3(0.0050, 0.0068, 0.0120);   // what the night sky adds
@@ -965,7 +979,7 @@ vec3 groundView(vec3 ro, vec3 rd, float cosT, out float tHit){
     if (uSunDir.y > 0.05){
       vec3 pcs = po + uSunDir * ((CLOUD_BASE + 1.0 - po.y) / uSunDir.y);
       float aS = texture(uNoise, vec3(pcs.xz * F_A, 0.137)).b;
-      sOpen = 1.0 - smoothstep(0.42, 0.52, coverageAt(pcs.xz, aS));
+      sOpen = 1.0 - smoothstep(0.42, 0.52, coverageAt(pcs.xz, aS) + bigBias(pcs.xz) * 0.03);
     }
   }
   if (land){

@@ -4,12 +4,22 @@
 const TILE_URL = (z: number, x: number, y: number) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`
 
 const cache = new Map<string, Float32Array>()
+const pending = new Map<string, Promise<Float32Array>>()
+const CAP = 110
 
 /** Decode one Terrarium tile to metres (256 x 256). */
-export async function fetchTileElevation(z: number, x: number, y: number, signal?: AbortSignal): Promise<Float32Array> {
+export function fetchTileElevation(z: number, x: number, y: number, signal?: AbortSignal): Promise<Float32Array> {
   const key = `${z}/${x}/${y}`
   const hit = cache.get(key)
-  if (hit) return hit
+  if (hit) { cache.delete(key); cache.set(key, hit); return Promise.resolve(hit) } // refresh recency
+  const run = pending.get(key)
+  if (run) return run
+  const pr = decodeTile(z, x, y, key, signal).finally(() => pending.delete(key))
+  pending.set(key, pr)
+  return pr
+}
+
+async function decodeTile(z: number, x: number, y: number, key: string, signal?: AbortSignal): Promise<Float32Array> {
   const res = await fetch(TILE_URL(z, x, y), { signal })
   if (!res.ok) throw new Error(`Elevation tile ${key} failed (${res.status})`)
   const bmp = await createImageBitmap(await res.blob(), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' })
@@ -20,7 +30,7 @@ export async function fetchTileElevation(z: number, x: number, y: number, signal
   const px = ctx.getImageData(0, 0, 256, 256).data
   const out = new Float32Array(256 * 256)
   for (let i = 0; i < out.length; i++) out[i] = px[i * 4] * 256 + px[i * 4 + 1] + px[i * 4 + 2] / 256 - 32768
-  if (cache.size > 200) cache.delete(cache.keys().next().value!)
+  while (cache.size >= CAP) cache.delete(cache.keys().next().value!)
   cache.set(key, out)
   return out
 }
