@@ -38,7 +38,7 @@ Make flights of thousands of km work over real places.
       north-south flights
 - [x] Rolling windows load ahead in the direction of travel, with no hitches at speed
 - [x] Cloud field doesn't visibly repeat on long flights (the 320-unit tile)
-- [x] Coast-to-coast test: no seams, jumps or precision jitter; build passes
+- [ ] Coast-to-coast test: no seams, jumps or precision jitter (fast partial flights pass; full ~3,900 km run not done yet); build passes ✓
 
 **N1 plan** (child session `n1-long-flight`):
 1. *Re-anchor.* Shift the world by whole multiples of 1920 units when the camera is >1400 from 0. 1920 is a
@@ -86,6 +86,7 @@ fast flights NYC west at 40 u/s and Seattle south at 90 u/s: p99 frame 9.5 ms, 2
 - [ ] Build passes; screenshots at 3 km and 10 km vs the Apple Maps references
 
 ## Master integration
+- [x] N1 merged into main (3940049). Open: occasional ~40 ms frame at the end of a window bake.
 - [ ] Merge each step after review
 - [ ] Performance check on the user's machine
 - [ ] README update
