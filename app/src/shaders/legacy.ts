@@ -214,20 +214,64 @@ float cumulonimbus(vec3 p, float bil, float lob){
   return best;
 }
 
+// Wide storm cloud: a broad, flat-based mass (much wider than tall, a dark flat ceiling underneath) whose top is a
+// pile of big bubbles stacked in tiers, some higher at one end. Cells are TILE/4, a cloud stays within ~0.7 of that.
+float wideCloud(vec3 p, float bil, float lob){
+  const float WCELL = TILE / 4.0;
+  vec2 g = p.xz / WCELL - 0.5;
+  vec2 i0 = floor(g);
+  float best = -40.0;
+  for (int j = 0; j < 2; j++){
+    for (int i = 0; i < 2; i++){
+      vec2 id = i0 + vec2(float(i), float(j));
+      vec2 idw = mod(id, 4.0);
+      vec4 h = hash42(idw * 5.17 + 211.3);
+      if (h.x < 1.0 - clamp(uStorm * 0.55, 0.0, 1.0)) continue;
+      vec2 c = (id + 0.3 + 0.4 * h.yz) * WCELL;
+      float h2 = hash12(idw * 2.71 + 17.9);
+      float R = 15.0 + 10.0 * h.w;                         // footprint radius
+      float el = 1.0 + 0.5 * fract(h2 * 7.7);              // elongation
+      float a0 = fract(h2 * 3.3) * 6.2832;
+      float Hh = 9.0 + 12.0 * fract(h2 * 11.1);            // how far the tiers climb
+      float base = CLOUD_BASE + 0.5 + 6.0 * fract(h2 * 5.9) * fract(h2 * 5.9);   // flat underside, sometimes well above the deck
+      if (pdist(c.x - pathX(c.y)) < R * 1.6 + 6.0) continue;
+      vec2 dc = p.xz - c;
+      float reach = R * el + 18.0;
+      if (dot(dc, dc) > reach * reach || p.y > base + Hh + 16.0) continue;
+      float cl = -1e3;
+      for (int k = 0; k < 10; k++){
+        vec4 hk = hash42(idw * 4.3 + float(k) * 7.9 + 91.1);
+        float tk = float(k) / 9.0;
+        float rk = mix(11.0, 6.0, tk) * (0.7 + 0.6 * hk.x);
+        float ang = hk.y * 6.2832;
+        float off = R * sqrt(hk.z) * (1.0 - 0.45 * tk);
+        vec2 o = rot2(vec2(cos(ang) * off * el, sin(ang) * off / el), a0);
+        vec2 cxz = c + o + WIND * tk * 4.0;
+        vec3 d = p - vec3(cxz.x, base + rk * 0.35 + tk * Hh * (0.5 + 0.5 * hk.w), cxz.y);
+        cl = smax(cl, rk - length(d), rk * 0.5);
+      }
+      cl = min(cl, p.y - base);                           // the flat base
+      cl += (lob - 0.5) * 4.0 + (bil - 0.5) * 3.2;
+      best = max(best, cl);
+    }
+  }
+  return best;
+}
+
 float sceneSD(vec3 p){
   float bil = billow(p);
   float lob = lobes(p);
   float sea = (p.y > SEA_TOP) ? min(SEA_TOP - p.y, -0.4) : seaSD(p, bil);
   float tw = towers(p, bil, lob);
   float cb = cumulonimbus(p, bil, lob);
-  return smax(smax(sea, tw, 0.9), cb, 1.2);
+  return smax(smax(smax(sea, tw, 0.9), cb, 1.2), wideCloud(p, bil, lob), 1.2);
 }
 // Same field without the above-the-deck shortcut, which is only a bound for skipping
 // and must not be baked as if it were real cloud.
 float sceneSDFull(vec3 p){
   float bil = billow(p);
   float lob = lobes(p);
-  return smax(smax(seaSD(p, bil), towers(p, bil, lob), 0.9), cumulonimbus(p, bil, lob), 1.2);
+  return smax(smax(smax(seaSD(p, bil), towers(p, bil, lob), 0.9), cumulonimbus(p, bil, lob), 1.2), wideCloud(p, bil, lob), 1.2);
 }
 float densLight(float sd){ return clamp((sd + 0.1) * 1.3, 0.0, 1.0); }
 `;
@@ -878,25 +922,34 @@ void main(){
       vec2 lt = uDayAmt < 0.999 ? lightAt(p, t) : vec2(0.0, baked(p).y);
       float powder = 1.0 - exp(-max(sd, 0.0) * 2.6 - d * 0.5);
       float hgt = clamp((p.y + 6.0) / 15.0, 0.0, 1.0);
+      // Patchy "heaviness" (about one patch per cloud): heavy clouds soak up more light, so they come out grey to dark
+      // with dim fill, light ones stay bright; it also tints them a little warm or cool.
+      float hv = smoothstep(0.35, 0.65, texture(uNoise, vec3(p.xz * (5.0 / TILE) + 0.7, 0.62)).b);
+      hv *= mix(0.5, 1.0, uDayAmt);   // by moonlight the clouds are dark enough already
+      float sigH = SIG * (1.0 + 3.0 * hv);
+      float ambK = mix(1.1, 0.35, hv);
       float occ = exp(-max(sd, 0.0) * 0.5) * mix(0.15, 1.0, exp(-lt.y * 0.5));
       vec3 Lm = vec3(0.0), Ls = vec3(0.0);
       if (uDayAmt < 0.999){
         float od = lt.x;
-        float e = ph0 * exp(-od * SIG) + 0.34 * ph1 * exp(-od * SIG * 0.40) + 0.14 * ph2 * exp(-od * SIG * 0.17);
+        float e = ph0 * exp(-od * sigH) + 0.34 * ph1 * exp(-od * sigH * 0.40) + 0.14 * ph2 * exp(-od * sigH * 0.17);
         float pf = mix(mix(0.42, 1.0, powder), 1.0, backlit);
-        vec3 amb = mix(AMB_LO, AMB_HI, sqrt(hgt)) * (0.28 + 0.72 * occ);
+        vec3 amb = mix(AMB_LO, AMB_HI, sqrt(hgt)) * (0.28 + 0.72 * occ) * ambK;
         Lm = lightCol * (MOON_I * e * pf) + amb;
       }
       if (uDayAmt > 0.001){
         float odS = sunOd(p, t);
-        float eS = sph0 * exp(-odS * SIG) + 0.34 * sph1 * exp(-odS * SIG * 0.40) + 0.14 * sph2 * exp(-odS * SIG * 0.17);
+        float eS = sph0 * exp(-odS * sigH) + 0.34 * sph1 * exp(-odS * sigH * 0.40) + 0.14 * sph2 * exp(-odS * sigH * 0.17);
         float pfS = mix(mix(0.42, 1.0, powder), 1.0, backlitS);
-        vec3 ambS = mix(ambLoD, ambHiD, sqrt(hgt)) * (0.28 + 0.72 * occ);
+        vec3 ambS = mix(ambLoD, ambHiD, sqrt(hgt)) * (0.28 + 0.72 * occ) * ambK;
         Ls = (sunCol * (SUN_D * eS * pfS) + ambS) * invL;
       }
       vec3 L = mix(Lm, Ls, uDayAmt);
+      // dark undersides: more so in heavy clouds
+      L *= 1.0 - (0.35 + 0.45 * hv) * (1.0 - smoothstep(-2.0, 18.0, p.y));
+      L *= mix(vec3(1.0, 0.97, 0.93), vec3(0.93, 0.97, 1.04), fract(hv * 3.7));
       if (uFlash > 0.0) L += lightningAt(p);
-      float fogA = 1.0 - exp(-t * 0.016 * mix(1.0, 0.3, smoothstep(4.0, 30.0, p.y)));
+      float fogA = 1.0 - exp(-t * 0.016 * mix(1.0, 0.3, smoothstep(4.0, 30.0, p.y)) * mix(1.0, 0.4, uDayAmt));   // clearer air by day
       // Up close the air is a plain night blue. The sky's colour in this direction (its
       // warm horizon band, the moon's halo) comes from a long path of air, so only
       // distant cloud takes it on; otherwise near clouds wear a stripe of horizon glow.

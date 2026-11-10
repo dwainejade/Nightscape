@@ -120,6 +120,12 @@ heading, height (flat to tall) and bubble sizes. Storm towers: 16 per tile inste
 wind shear direction and strength, anvil size, and often a second smaller updraft. Bake time unchanged within noise (~4.4 s here, pane throttled).
 Tuning knobs: the `cumulusLayer` calls in `towers()` (size, density, height) and `uStorm * 0.6` gating in `cumulonimbus`.
 
+**N2 follow-up: MSFS-style clouds (1 of 2)** `wideCloud` (new): broad flat-based storm masses (radius 15-25, 10 tiered bubbles, base up to 6 above the deck), density follows `storm`.
+Per-cloud shades: a patchy "heaviness" noise (`hv` in `CLOUD_FRAG`, ~1 patch per cloud) raises extinction toward the sun/moon and cuts ambient fill, with a
+stronger dark-underside gradient and a slight warm/cool tint; halved at night. Daytime haze cut to 40%. Checked at noon: white tops, grey-to-dark bases,
+bright and heavy clouds side by side; 120 fps in the preview. Still to do: finer surface detail octaves, a second (stratocumulus) layer, daytime tuning of
+the neutral grey (undersides are still a bit blue).
+
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here
 - [ ] Real lights from NASA Black Marble (GIBS WMTS, public domain, keyless) in the terrain window,
