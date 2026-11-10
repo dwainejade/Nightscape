@@ -183,7 +183,8 @@ float cumulonimbus(vec3 p, float bil, float lob){
       float h2 = hash12(idw * 3.17 + 41.3);
       float h3 = fract(h2 * 7.13), h4 = fract(h2 * 13.7), h6 = fract(h2 * 29.1), h7 = fract(h2 * 43.9);
       float H = 14.0 + 34.0 * h2 * h2;                  // mostly mid-sized, a few giants
-      float anvil = smoothstep(24.0, 34.0, H);          // only the tall ones spread an anvil
+      float typ = fract(h2 * 61.7);                     // 0-0.2 multi-cell, 0.2-0.4 turret tower, above that classic anvil
+      float anvil = smoothstep(24.0, 34.0, H) * step(0.4, typ);   // only the tall classic ones spread an anvil
       float A = 3.0 + 5.0 * h3;
       float Ra = R0 * (1.5 + 1.0 * h4);
       vec2 W = rot2(WIND, (h6 - 0.5) * 1.5) * (0.5 + 1.0 * h7);   // each sheared its own way
@@ -197,13 +198,36 @@ float cumulonimbus(vec3 p, float bil, float lob){
       float sd = min(rad - length(p.xz - ctr), H - p.y);
       vec3 ov = vec3(p.x - col.x, (p.y - (H + 0.5)) * 1.6, p.z - col.y);
       sd = max(sd, R0 * (0.6 + 0.4 * h3) - length(ov));
-      if (h7 > 0.35){
+      if (typ >= 0.4 && h7 > 0.35){
         // a second, lower updraft beside it
         float H2 = H * (0.45 + 0.35 * h4), R2 = R0 * (0.55 + 0.3 * h3);
         float t2 = clamp((p.y - CLOUD_BASE) / (H2 - CLOUD_BASE), 0.0, 1.0);
         vec2 c2 = c + rot2(vec2(R0 * 1.15, 0.0), h2 * 6.2832) + W * t2 * t2 * R2 * 0.7;
         float s2 = min(R2 * (0.9 + 0.3 * t2) - length(p.xz - c2), H2 - p.y);
         sd = smax(sd, s2, 3.0);
+      }
+      if (typ < 0.4){
+        // towering cumulus with no anvil: a crown of rounded turrets at different heights
+        for (int k = 0; k < 4; k++){
+          vec4 hk = hash42(idw * 2.9 + float(k) * 5.3 + 77.7);
+          float tk = 0.55 + 0.45 * float(k) / 3.0;
+          float rk = R0 * (0.45 + 0.4 * hk.x);
+          vec2 ck = col + rot2(vec2(R0 * 0.6 * hk.z, 0.0), hk.y * 6.2832);
+          vec3 d = p - vec3(ck.x, H * tk - rk * 0.4, ck.y);
+          sd = smax(sd, rk - length(d), rk * 0.6);
+        }
+      }
+      if (typ < 0.2){
+        // multi-cell: two more full columns beside it, each its own height
+        for (int k = 0; k < 2; k++){
+          vec4 hk = hash42(idw * 6.1 + float(k) * 9.7 + 33.3);
+          float Hk = H * (0.5 + 0.45 * hk.x), Rk = R0 * (0.6 + 0.35 * hk.y);
+          float tk = clamp((p.y - CLOUD_BASE) / (Hk - CLOUD_BASE), 0.0, 1.0);
+          vec2 ck = c + rot2(vec2(R0 * (1.2 + 0.3 * hk.z), 0.0), hk.w * 6.2832 + float(k) * 3.1416) + W * tk * tk * Rk * 0.7;
+          float sk = min(Rk * (0.85 + 0.3 * tk) - length(p.xz - ck), Hk - p.y);
+          sk = max(sk, Rk * 0.7 - length(vec3(p.x - ck.x, (p.y - Hk) * 1.5, p.z - ck.y)));
+          sd = smax(sd, sk, 3.0);
+        }
       }
       sd = min(sd, p.y - (CLOUD_BASE - 1.0));
       float lump = mix(R0 * 0.55, 1.2, an);

@@ -130,6 +130,10 @@ the neutral grey (undersides are still a bit blue).
 of flat-bottomed stratocumulus in long rows (base y~19-21, follows `cover`/`deckH`), so cruise (y 6.5) flies between two decks; daytime ambient made
 neutral grey instead of blue. Checked at noon from cruise (layered sky, grey-white shades) and from above (y 30); 120 fps in the preview.
 
+**N2 follow-up: storm tower variety** `cumulonimbus` now has three types per cell (hash): classic anvil (60%), towering cumulus with no anvil and a crown of
+four rounded turrets (20%), and multi-cell (20%: main column plus two more at their own heights). Combined with the per-cell height, girth, shear and
+optional second updraft from before. Checked from y 40 at noon: crowned tower beside flat-topped ones.
+
 ### N3: Real night lights + glow under clouds
 - [ ] Plan written here
 - [ ] Real lights from NASA Black Marble (GIBS WMTS, public domain, keyless) in the terrain window,
