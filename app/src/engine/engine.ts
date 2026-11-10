@@ -176,9 +176,11 @@ export class Engine {
     }
     const camU = this.camU
     // 3D render targets the bakes draw into one layer at a time (no CPU readback)
+    // 16-bit where the GPU allows: the cloud shape is read many times along each sun ray, so 8-bit steps would show as banding
+    const vtype = this.canFloat ? THREE.HalfFloatType : THREE.UnsignedByteType
     const mk3 = (n: number, nz: number, format: number) => {
       const rt = new THREE.WebGL3DRenderTarget(n, n, nz, {
-        format, type: THREE.UnsignedByteType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+        format, type: vtype, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
         depthBuffer: false, stencilBuffer: false, generateMipmaps: false,
       })
       rt.texture.wrapS = rt.texture.wrapT = THREE.RepeatWrapping
@@ -675,6 +677,18 @@ export class Engine {
       this.taaPass.u.uReset.value = 1
     }
     if (useSettings.getState().manual !== on) useSettings.setState({ manual: on })
+  }
+
+  /** Test hook: switch to free flight and put the camera somewhere, looking along yaw/pitch (radians; yaw 0 is forward, -z). */
+  setView(yaw: number, pitch = 0, x?: number, y?: number, z?: number) {
+    this.setManual(true)
+    const f = this.fly
+    f.yaw = yaw; f.pitch = pitch
+    if (x !== undefined) f.x = x
+    if (y !== undefined) f.y = y
+    if (z !== undefined) f.z = z
+    f.vx = f.vy = f.vz = 0
+    this.taaPass.u.uReset.value = 1
   }
 
   private updateFly(dt: number) {

@@ -680,17 +680,19 @@ vec2 lightAt(vec3 p, float t){
 // Optical depth toward the sun. The bake only knows the moon's fixed direction, but the sun moves,
 // so this is read live from the baked shape: two crisp samples near the point (with the fine
 // detail), then six coarse ones out to ~36 units. (Same units and far-shadow fill-in as the bake.)
-float sunOd(vec3 p, float t){
+float sunOd(vec3 p, float t, float j){
   vec3 d = uSunDir;
+  // the sample distances are jittered per pixel (and per frame), so any error left in the field becomes
+  // fine noise that the temporal accumulation removes, instead of visible rings
   float od = 0.0;
   if (t < 80.0) od += (densLight(shapeSD(p + d * 0.15)) + densLight(shapeSD(p + d * 0.45))) * 0.3;
   else od += (densLight(bakedSD(p + d * 0.15)) + densLight(bakedSD(p + d * 0.45))) * 0.3;
-  od += densLight(bakedSD(p + d * 1.1)) * 1.00 * 0.978;
-  od += densLight(bakedSD(p + d * 2.4)) * 1.60 * 0.953;
-  od += densLight(bakedSD(p + d * 4.8)) * 3.20 * 0.908;
-  od += densLight(bakedSD(p + d * 9.2)) * 5.60 * 0.832;
-  od += densLight(bakedSD(p + d * 16.0)) * 8.00 * 0.726;
-  od += densLight(bakedSD(p + d * 28.0)) * 16.0 * 0.571;
+  od += densLight(bakedSD(p + d * (1.1 * (0.75 + 0.5 * fract(j + 0.618))))) * 1.00 * 0.978;
+  od += densLight(bakedSD(p + d * (2.4 * (0.75 + 0.5 * fract(j + 0.236))))) * 1.60 * 0.953;
+  od += densLight(bakedSD(p + d * (4.8 * (0.75 + 0.5 * fract(j + 0.854))))) * 3.20 * 0.908;
+  od += densLight(bakedSD(p + d * (9.2 * (0.75 + 0.5 * fract(j + 0.472))))) * 5.60 * 0.832;
+  od += densLight(bakedSD(p + d * (16.0 * (0.75 + 0.5 * fract(j + 0.090))))) * 8.00 * 0.726;
+  od += densLight(bakedSD(p + d * (28.0 * (0.75 + 0.5 * fract(j + 0.708))))) * 16.0 * 0.571;
   return od;
 }
 
@@ -799,7 +801,9 @@ void main(){
       // changes up to ~6.7x faster than distance, so a long skip can jump right over a
       // cloud, and whether it does flips as the camera moves. Skip only a fifth of it.
       float sk = min(-sd * 0.2, 2.0);
-      if (!planar) t += max(dt, sk);
+      // (jittered: otherwise neighbouring rays all land at the same depth under the surface, and the
+      // shading, which depends on that depth, shows as rings across the cloud when looking sideways or back)
+      if (!planar) t += max(dt, sk * (0.7 + 0.5 * fract(jit + float(i) * 0.618034)));
       // no further than one regular step: take exactly that step (t may sit on a finer
       // grid than sp, so stepping a full dt from it could pass over the next plane)
       else if (sk <= dt) t = nextSampleT(ro.z, rz, t, sp, spB, refine);
@@ -839,7 +843,7 @@ void main(){
         Lm = lightCol * (MOON_I * e * pf) + amb;
       }
       if (uDayAmt > 0.001){
-        float odS = sunOd(p, t);
+        float odS = sunOd(p, t, jit);
         float eS = sph0 * exp(-odS * SIG) + 0.34 * sph1 * exp(-odS * SIG * 0.40) + 0.14 * sph2 * exp(-odS * SIG * 0.17);
         float pfS = mix(mix(0.42, 1.0, powder), 1.0, backlitS);
         vec3 ambS = mix(ambLoD, ambHiD, sqrt(hgt)) * (0.28 + 0.72 * occ);
