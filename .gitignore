@@ -2,3 +2,4 @@
 *.log
 tools/profile/
 *.mp4
+.claude/worktrees/
